@@ -26,18 +26,20 @@ func (a *Archiver) DateDir(t time.Time) string { return t.Format(dateLayout) }
 
 // RequestMeta 归档的请求元信息。
 type RequestMeta struct {
-	RequestID     string            `json:"request_id"`
-	Time          time.Time         `json:"time"`
-	Username      string            `json:"username"`
-	APIKeyName    string            `json:"api_key_name"`
-	ClientIP      string            `json:"client_ip"`
-	RequestedModel string           `json:"requested_model"`
-	ChannelName   string            `json:"channel_name"`
-	UpstreamModel string            `json:"upstream_model"`
-	UpstreamURL   string            `json:"upstream_url"`
-	Stream        bool              `json:"stream"`
-	ClientHeaders map[string]string `json:"client_headers,omitempty"`
-	Body          json.RawMessage   `json:"body"`
+	RequestID      string            `json:"request_id"`
+	Time           time.Time         `json:"time"`
+	Protocol       string            `json:"protocol"`
+	Endpoint       string            `json:"endpoint"`
+	Username       string            `json:"username"`
+	APIKeyName     string            `json:"api_key_name"`
+	ClientIP       string            `json:"client_ip"`
+	RequestedModel string            `json:"requested_model"`
+	ChannelName    string            `json:"channel_name"`
+	UpstreamModel  string            `json:"upstream_model"`
+	UpstreamURL    string            `json:"upstream_url"`
+	Stream         bool              `json:"stream"`
+	ClientHeaders  map[string]string `json:"client_headers,omitempty"`
+	Body           json.RawMessage   `json:"body"`
 }
 
 func (a *Archiver) WriteRequest(dateDir, id string, meta *RequestMeta) error {

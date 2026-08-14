@@ -8,14 +8,14 @@ import (
 
 // Config 全部通过环境变量注入，DEMO 级别，给了合理默认值。
 type Config struct {
-	Port      string // 监听端口
-	DataDir   string // 数据目录（sqlite 文件 + 原文归档）
-	DBPath    string // sqlite 文件路径
-	ArchiveDir string // 请求/响应原文归档目录
-	JWTSecret string // JWT 签名密钥
-	AdminUser string // 初始管理员用户名
-	AdminPass string // 初始管理员密码
-	AllowRegister bool // 是否允许自助注册
+	Port          string // 监听端口
+	DataDir       string // 数据目录（sqlite 文件 + 原文归档）
+	DBPath        string // sqlite 文件路径
+	ArchiveDir    string // 请求/响应原文归档目录
+	JWTSecret     string // JWT 签名密钥
+	AdminUser     string // 初始管理员用户名
+	AdminPass     string // 初始管理员密码
+	AllowRegister bool   // 是否允许自助注册
 }
 
 func Load() *Config {

@@ -30,12 +30,16 @@ func (s *Server) Router() *gin.Engine {
 
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
 
-	// ---------- OpenAI 兼容网关（用本网关发放的 sk- key 调用）----------
-	v1 := r.Group("/v1", s.GatewayAuth())
-	{
-		v1.POST("/chat/completions", s.chatCompletions)
-		v1.GET("/models", s.listUpstreamModels)
+	// ---------- 协议网关：每个协议一个端点，同协议直转 ----------
+	// /v1/chat/completions、/v1/responses、/v1/messages ... 由协议注册表自动生成
+	v1 := r.Group("", s.GatewayAuth())
+	for _, p := range relay.Protocols() {
+		proto := p
+		v1.POST(proto.InboundPath(), func(c *gin.Context) {
+			s.relay.Handle(proto, c.Writer, c.Request, currentActor(c))
+		})
 	}
+	v1.GET("/v1/models", s.listGatewayModels)
 
 	// ---------- 管理 API（JWT）----------
 	api := r.Group("/api")

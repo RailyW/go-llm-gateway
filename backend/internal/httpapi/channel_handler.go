@@ -31,6 +31,11 @@ type channelDTO struct {
 	APIKey string `json:"api_key"` // 覆盖为掩码
 }
 
+func toChannelDTO(ch store.Channel) channelDTO {
+	ch.ProtocolList = store.SplitProtocols(ch.Protocols) // Create 之后 AfterFind 不会触发，这里补一下
+	return channelDTO{Channel: ch, APIKey: maskKey(ch.APIKey)}
+}
+
 func (s *Server) listChannels(c *gin.Context) {
 	var list []store.Channel
 	if err := s.db.Order("id asc").Find(&list).Error; err != nil {
@@ -39,17 +44,17 @@ func (s *Server) listChannels(c *gin.Context) {
 	}
 	out := make([]channelDTO, 0, len(list))
 	for _, ch := range list {
-		out = append(out, channelDTO{Channel: ch, APIKey: maskKey(ch.APIKey)})
+		out = append(out, toChannelDTO(ch))
 	}
 	c.JSON(http.StatusOK, out)
 }
 
 type channelInput struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
-	Enabled *bool  `json:"enabled"`
+	Name      string   `json:"name"`
+	Protocols []string `json:"protocols"`
+	BaseURL   string   `json:"base_url"`
+	APIKey    string   `json:"api_key"`
+	Enabled   *bool    `json:"enabled"`
 }
 
 func (s *Server) createChannel(c *gin.Context) {
@@ -63,14 +68,15 @@ func (s *Server) createChannel(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "name 和 base_url 必填")
 		return
 	}
-	if in.Type == "" {
-		in.Type = "openai"
+	if len(in.Protocols) == 0 {
+		in.Protocols = []string{relay.ProtocolOpenAIChat}
 	}
-	if _, err := relay.GetAdapter(in.Type); err != nil {
-		fail(c, http.StatusBadRequest, "不支持的上游类型: "+in.Type)
+	protocols, err := relay.NormalizeProtocols(in.Protocols)
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	ch := store.Channel{Name: in.Name, Type: in.Type, BaseURL: in.BaseURL, APIKey: in.APIKey, Enabled: true}
+	ch := store.Channel{Name: in.Name, Protocols: protocols, BaseURL: in.BaseURL, APIKey: in.APIKey, Enabled: true}
 	if in.Enabled != nil {
 		ch.Enabled = *in.Enabled
 	}
@@ -78,7 +84,7 @@ func (s *Server) createChannel(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	c.JSON(http.StatusOK, channelDTO{Channel: ch, APIKey: maskKey(ch.APIKey)})
+	c.JSON(http.StatusOK, toChannelDTO(ch))
 }
 
 func (s *Server) updateChannel(c *gin.Context) {
@@ -99,12 +105,13 @@ func (s *Server) updateChannel(c *gin.Context) {
 	if v := strings.TrimSpace(in.BaseURL); v != "" {
 		updates["base_url"] = v
 	}
-	if in.Type != "" {
-		if _, err := relay.GetAdapter(in.Type); err != nil {
-			fail(c, http.StatusBadRequest, "不支持的上游类型: "+in.Type)
+	if len(in.Protocols) > 0 {
+		protocols, err := relay.NormalizeProtocols(in.Protocols)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		updates["type"] = in.Type
+		updates["protocols"] = protocols
 	}
 	// api_key 留空表示不改
 	if in.APIKey != "" {
@@ -119,7 +126,7 @@ func (s *Server) updateChannel(c *gin.Context) {
 			return
 		}
 	}
-	c.JSON(http.StatusOK, channelDTO{Channel: ch, APIKey: maskKey(ch.APIKey)})
+	c.JSON(http.StatusOK, toChannelDTO(ch))
 }
 
 func (s *Server) deleteChannel(c *gin.Context) {

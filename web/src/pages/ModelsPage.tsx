@@ -116,7 +116,9 @@ export default function ModelsPage() {
       <div className="flex items-end justify-between">
         <div>
           <h1 className="text-xl font-semibold">模型</h1>
-          <p className="text-sm text-muted-foreground">对外模型名 + 绑定到上游（可多绑定，由路由策略选择）</p>
+          <p className="text-sm text-muted-foreground">
+          对外模型名 + 绑定到上游（可多绑定，由路由策略选择）；客户端打某个端点时，只有支持该端点协议的绑定参与路由
+        </p>
         </div>
         <Button onClick={openCreateModel}>
           <Plus className="size-4" /> 新增模型
@@ -180,7 +182,7 @@ export default function ModelsPage() {
                     <TableRow key={`${m.id}-b`}>
                       <TableCell colSpan={7} className="bg-muted/40 p-4">
                         {bindings.length === 0 ? (
-                          <p className="text-sm text-muted-foreground">还没有绑定，点右侧「绑定」添加上游。</p>
+                          <p className="text-sm text-muted-foreground">还没有绑定，点右侧「绑定」添加上游。绑定上的徽标是该上游支持的端点协议。</p>
                         ) : (
                           <div className="space-y-2">
                             {bindings.map((b) => (
@@ -192,6 +194,11 @@ export default function ModelsPage() {
                                 <span className="font-medium">{b.channel?.name ?? `上游 ${b.channel_id}`}</span>
                                 <span className="text-muted-foreground">→</span>
                                 <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{b.upstream_model}</code>
+                                {(b.channel?.protocols ?? []).map((p) => (
+                                  <Badge key={p} variant="secondary" title="该上游支持的端点协议">
+                                    {p}
+                                  </Badge>
+                                ))}
                                 <span className="text-xs text-muted-foreground">权重 {b.weight}</span>
                                 {!b.enabled && <Badge variant="destructive">已禁用</Badge>}
                                 <div className="ml-auto flex items-center gap-1">

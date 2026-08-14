@@ -98,6 +98,7 @@ export default function LogsPage() {
               <TableRow>
                 <TableHead>时间</TableHead>
                 <TableHead>用户</TableHead>
+                <TableHead>端点</TableHead>
                 <TableHead>模型</TableHead>
                 <TableHead>上游</TableHead>
                 <TableHead>状态</TableHead>
@@ -107,13 +108,16 @@ export default function LogsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {items.length === 0 && <TableEmpty colSpan={8} />}
+              {items.length === 0 && <TableEmpty colSpan={9} />}
               {items.map((l) => (
                 <TableRow key={l.id}>
                   <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                     {new Date(l.created_at).toLocaleString()}
                   </TableCell>
                   <TableCell>{l.username}</TableCell>
+                  <TableCell className="whitespace-nowrap font-mono text-xs" title={l.protocol}>
+                    {l.endpoint || '—'}
+                  </TableCell>
                   <TableCell className="font-mono text-xs">
                     {l.model_name}
                     {l.stream && <Badge variant="outline" className="ml-1">stream</Badge>}
@@ -163,7 +167,7 @@ export default function LogsPage() {
           <DialogHeader>
             <DialogTitle>请求原文</DialogTitle>
             <DialogDescription className="font-mono text-xs">
-              {detail?.id} · {detail?.model_name} → {detail?.channel_name}/{detail?.upstream_model}
+              {detail?.id} · {detail?.endpoint} · {detail?.model_name} → {detail?.channel_name}/{detail?.upstream_model}
             </DialogDescription>
           </DialogHeader>
           {detail?.error_message && (

@@ -1,6 +1,11 @@
 package store
 
-import "time"
+import (
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+)
 
 // User 平台用户。role: admin | user
 type User struct {
@@ -20,16 +25,19 @@ const (
 	RoleUser  = "user"
 )
 
-// Channel 上游资产：base_url + api_key。Type 决定用哪个协议适配器（当前只有 openai）。
+// Channel 上游资产：base_url + api_key。
+// Protocols 是该上游**支持的端点协议**列表，存成 ",openai-chat,openai-responses," 便于 LIKE 匹配。
 type Channel struct {
-	ID        uint      `gorm:"primarykey" json:"id"`
-	Name      string    `gorm:"size:128;not null" json:"name"`
-	Type      string    `gorm:"size:32;not null;default:openai" json:"type"`
-	BaseURL   string    `gorm:"size:512;not null" json:"base_url"`
-	APIKey    string    `gorm:"size:512" json:"api_key"`
-	Enabled   bool      `gorm:"not null;default:true" json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        uint   `gorm:"primarykey" json:"id"`
+	Name      string `gorm:"size:128;not null" json:"name"`
+	Protocols string `gorm:"size:255;not null;default:',openai-chat,'" json:"-"`
+	// ProtocolList 非数据库字段，AfterFind 里从 Protocols 展开，给前端用
+	ProtocolList []string  `gorm:"-" json:"protocols"`
+	BaseURL      string    `gorm:"size:512;not null" json:"base_url"`
+	APIKey       string    `gorm:"size:512" json:"api_key"`
+	Enabled      bool      `gorm:"not null;default:true" json:"enabled"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // Model 对外暴露的模型名（客户端请求里填的 model）。
@@ -75,6 +83,8 @@ type APIKey struct {
 // 与 archive 目录下的原文文件名一一对应。
 type RequestLog struct {
 	ID               string    `gorm:"primarykey;size:36" json:"id"`
+	Protocol         string    `gorm:"size:32;index" json:"protocol"` // openai-chat / openai-responses / anthropic-messages
+	Endpoint         string    `gorm:"size:64" json:"endpoint"`       // 客户端请求的路径
 	UserID           uint      `gorm:"index" json:"user_id"`
 	Username         string    `gorm:"size:64" json:"username"`
 	APIKeyID         uint      `gorm:"index" json:"api_key_id"`
@@ -100,4 +110,34 @@ type Setting struct {
 	Key       string    `gorm:"primarykey;size:64" json:"key"`
 	Value     string    `gorm:"size:512" json:"value"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ---------- Channel.Protocols 的存储格式辅助 ----------
+//
+// 存成 ",openai-chat,openai-responses," 这种带前后逗号的串，
+// 好处是 SQL 里可以用 protocols LIKE '%,openai-chat,%' 精确匹配单个协议。
+
+// JoinProtocols 列表 -> 存储串。
+func JoinProtocols(names []string) string {
+	if len(names) == 0 {
+		return ","
+	}
+	return "," + strings.Join(names, ",") + ","
+}
+
+// SplitProtocols 存储串 -> 列表。
+func SplitProtocols(s string) []string {
+	out := []string{}
+	for _, p := range strings.Split(strings.Trim(s, ","), ",") {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// AfterFind 让 API 直接返回 protocols 数组，无需每处手动展开。
+func (c *Channel) AfterFind(*gorm.DB) error {
+	c.ProtocolList = SplitProtocols(c.Protocols)
+	return nil
 }

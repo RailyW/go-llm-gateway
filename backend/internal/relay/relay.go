@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -53,14 +52,17 @@ func NewService(db *gorm.DB, archiver *Archiver) *Service {
 	}
 }
 
-// ChatCompletions 处理 POST /v1/chat/completions
-func (s *Service) ChatCompletions(w http.ResponseWriter, r *http.Request, actor Actor) {
+// Handle 处理某个协议端点的一次转发。整个流程与具体协议无关：
+// 解析 model -> 选上游(必须支持该协议) -> 换模型名 -> 直转 -> 原样回吐 -> 落日志/归档。
+func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, actor Actor) {
 	start := time.Now()
 	reqID := uuid.NewString()
 	dateDir := s.archiver.DateDir(start)
 
 	rec := &store.RequestLog{
 		ID:          reqID,
+		Protocol:    p.Name(),
+		Endpoint:    p.InboundPath(),
 		UserID:      actor.UserID,
 		Username:    actor.Username,
 		APIKeyID:    actor.APIKeyID,
@@ -72,75 +74,61 @@ func (s *Service) ChatCompletions(w http.ResponseWriter, r *http.Request, actor 
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
 	if err != nil {
-		s.fail(w, rec, http.StatusBadRequest, "读取请求体失败: "+err.Error())
+		s.fail(w, p, rec, http.StatusBadRequest, "读取请求体失败: "+err.Error())
 		return
 	}
 
-	var head struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
-	}
-	if err := json.Unmarshal(body, &head); err != nil {
-		s.archiveRequest(dateDir, reqID, rec, body, "", false, nil)
-		s.fail(w, rec, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
-		return
-	}
-	rec.ModelName = head.Model
-	rec.Stream = head.Stream
-	if head.Model == "" {
-		s.archiveRequest(dateDir, reqID, rec, body, "", head.Stream, r.Header)
-		s.fail(w, rec, http.StatusBadRequest, "缺少 model 字段")
-		return
-	}
-
-	binding, model, err := s.pick(head.Model)
+	model, stream, err := p.ParseRequest(body)
 	if err != nil {
-		s.archiveRequest(dateDir, reqID, rec, body, "", head.Stream, r.Header)
-		s.fail(w, rec, http.StatusNotFound, err.Error())
+		s.archiveRequest(dateDir, reqID, rec, body, "", false, nil)
+		s.fail(w, p, rec, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	_ = model
+	rec.ModelName, rec.Stream = model, stream
+	if model == "" {
+		s.archiveRequest(dateDir, reqID, rec, body, "", stream, r.Header)
+		s.fail(w, p, rec, http.StatusBadRequest, "缺少 model 字段")
+		return
+	}
+
+	binding, err := s.pick(model, p.Name())
+	if err != nil {
+		s.archiveRequest(dateDir, reqID, rec, body, "", stream, r.Header)
+		s.fail(w, p, rec, http.StatusNotFound, err.Error())
+		return
+	}
 	rec.ChannelID = binding.ChannelID
 	rec.ChannelName = binding.Channel.Name
 	rec.UpstreamModel = binding.UpstreamModel
 
-	adapter, err := GetAdapter(binding.Channel.Type)
+	upBody, err := p.ReplaceModel(body, binding.UpstreamModel)
 	if err != nil {
-		s.archiveRequest(dateDir, reqID, rec, body, "", head.Stream, r.Header)
-		s.fail(w, rec, http.StatusInternalServerError, err.Error())
+		s.archiveRequest(dateDir, reqID, rec, body, "", stream, r.Header)
+		s.fail(w, p, rec, http.StatusBadRequest, "改写 model 字段失败: "+err.Error())
 		return
-	}
-
-	upBody, err := replaceModel(body, binding.UpstreamModel)
-	if err != nil {
-		s.archiveRequest(dateDir, reqID, rec, body, "", head.Stream, r.Header)
-		s.fail(w, rec, http.StatusBadRequest, "改写 model 字段失败: "+err.Error())
-		return
-	}
-
-	chatReq := &ChatRequest{
-		UpstreamModel: binding.UpstreamModel,
-		Stream:        head.Stream,
-		Body:          upBody,
-		ClientHeader:  r.Header,
 	}
 
 	timeout := store.GetSettingDuration(store.KeyUpstreamTimeoutSecond, time.Second, 300*time.Second)
 	ctx := r.Context()
-	var cancel context.CancelFunc
-	if !head.Stream {
+	if !stream {
+		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 
-	upReq, err := adapter.BuildRequest(ctx, binding.Channel, chatReq)
+	upReq, err := p.BuildRequest(ctx, binding.Channel, &ProtoRequest{
+		UpstreamModel: binding.UpstreamModel,
+		Stream:        stream,
+		Body:          upBody,
+		ClientHeader:  r.Header,
+	})
 	if err != nil {
-		s.archiveRequest(dateDir, reqID, rec, body, "", head.Stream, r.Header)
-		s.fail(w, rec, http.StatusInternalServerError, "构造上游请求失败: "+err.Error())
+		s.archiveRequest(dateDir, reqID, rec, body, "", stream, r.Header)
+		s.fail(w, p, rec, http.StatusInternalServerError, "构造上游请求失败: "+err.Error())
 		return
 	}
 	// 归档客户端原文（含上游目标信息）
-	s.archiveRequest(dateDir, reqID, rec, body, upReq.URL.String(), head.Stream, r.Header)
+	s.archiveRequest(dateDir, reqID, rec, body, upReq.URL.String(), stream, r.Header)
 
 	resp, err := s.client.Do(upReq)
 	if err != nil {
@@ -148,54 +136,44 @@ func (s *Service) ChatCompletions(w http.ResponseWriter, r *http.Request, actor 
 		if errors.Is(err, context.Canceled) {
 			status = 499
 		}
-		s.fail(w, rec, status, "请求上游失败: "+err.Error())
+		s.fail(w, p, rec, status, "请求上游失败: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
 	w.Header().Set("X-Gateway-Request-Id", reqID)
-	isStream := head.Stream && strings.Contains(resp.Header.Get("Content-Type"), "event-stream")
-
-	if isStream {
-		s.pipeStream(w, resp, adapter, rec, dateDir, start)
+	if strings.Contains(resp.Header.Get("Content-Type"), "event-stream") {
+		s.pipeStream(w, resp, p, rec, dateDir, start)
 		return
 	}
-	s.pipeJSON(w, resp, adapter, rec, dateDir, start)
+	s.pipeBody(w, resp, p, rec, dateDir, start)
 }
 
-// pipeJSON 非流式转发。
-func (s *Service) pipeJSON(w http.ResponseWriter, resp *http.Response, adapter Adapter, rec *store.RequestLog, dateDir string, start time.Time) {
+// pipeBody 非流式：原样回吐上游响应。
+func (s *Service) pipeBody(w http.ResponseWriter, resp *http.Response, p Protocol, rec *store.RequestLog, dateDir string, start time.Time) {
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		s.fail(w, rec, http.StatusBadGateway, "读取上游响应失败: "+err.Error())
+		s.fail(w, p, rec, http.StatusBadGateway, "读取上游响应失败: "+err.Error())
 		return
 	}
-	status, out, err := adapter.TransformResponse(resp.StatusCode, raw)
-	if err != nil {
-		s.fail(w, rec, http.StatusBadGateway, "转换上游响应失败: "+err.Error())
-		return
-	}
-	u := adapter.ExtractUsage(out)
+	var u Usage
+	p.MergeUsage(raw, &u)
 	rec.PromptTokens, rec.CompletionTokens, rec.TotalTokens = u.PromptTokens, u.CompletionTokens, u.TotalTokens
-	rec.StatusCode = status
-	if status >= 400 {
-		rec.ErrorMessage = truncate(string(out), 1000)
+	rec.StatusCode = resp.StatusCode
+	if resp.StatusCode >= 400 {
+		rec.ErrorMessage = truncate(string(raw), 1000)
 	}
 
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = "application/json"
-	}
-	w.Header().Set("Content-Type", ct)
-	w.WriteHeader(status)
-	_, _ = w.Write(out)
+	copyRespHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(raw)
 
 	rec.DurationMs = time.Since(start).Milliseconds()
-	s.finish(rec, dateDir, status, raw)
+	s.finish(rec, dateDir, resp.StatusCode, raw)
 }
 
-// pipeStream 流式转发（SSE），逐行透传并即时 flush。
-func (s *Service) pipeStream(w http.ResponseWriter, resp *http.Response, adapter Adapter, rec *store.RequestLog, dateDir string, start time.Time) {
+// pipeStream 流式：SSE 逐行原样透传并即时 flush，顺带抽 usage、留归档。
+func (s *Service) pipeStream(w http.ResponseWriter, resp *http.Response, p Protocol, rec *store.RequestLog, dateDir string, start time.Time) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -212,26 +190,15 @@ func (s *Service) pipeStream(w http.ResponseWriter, resp *http.Response, adapter
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			trimmed := bytes.TrimRight(line, "\r\n")
 			if archive.Len() < maxArchiveBytes {
 				archive.Write(line)
 			}
-			if payload, ok := ssePayload(trimmed); ok {
-				if u := adapter.ExtractUsage(payload); u.TotalTokens > 0 || u.CompletionTokens > 0 {
-					usage = u
-				}
+			if payload, ok := ssePayload(bytes.TrimRight(line, "\r\n")); ok {
+				p.MergeUsage(payload, &usage)
 			}
-			outLines, terr := adapter.TransformStreamLine(trimmed)
-			if terr != nil {
-				rec.ErrorMessage = truncate("转换流式响应失败: "+terr.Error(), 1000)
+			if _, werr := w.Write(line); werr != nil {
+				rec.ErrorMessage = "客户端断开: " + werr.Error()
 				break
-			}
-			for _, ol := range outLines {
-				if _, werr := w.Write(append(ol, '\n')); werr != nil {
-					rec.ErrorMessage = "客户端断开: " + werr.Error()
-					err = io.EOF
-					break
-				}
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -250,44 +217,49 @@ func (s *Service) pipeStream(w http.ResponseWriter, resp *http.Response, adapter
 	s.finish(rec, dateDir, resp.StatusCode, archive.Bytes())
 }
 
-// pick 找到模型并按策略选中一个可用绑定。
-func (s *Service) pick(modelName string) (*store.Binding, *store.Model, error) {
+// pick 找模型 -> 只保留**支持该协议**的上游绑定 -> 按策略选一个。
+func (s *Service) pick(modelName, protocol string) (*store.Binding, error) {
 	var m store.Model
 	if err := s.db.Where("name = ?", modelName).First(&m).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil, fmt.Errorf("模型 %s 不存在", modelName)
+			return nil, fmt.Errorf("模型 %s 不存在", modelName)
 		}
-		return nil, nil, err
+		return nil, err
 	}
 	if !m.Enabled {
-		return nil, nil, fmt.Errorf("模型 %s 已禁用", modelName)
+		return nil, fmt.Errorf("模型 %s 已禁用", modelName)
 	}
+
 	var bindings []store.Binding
 	err := s.db.Preload("Channel").
 		Joins("JOIN channels ON channels.id = bindings.channel_id").
 		Where("bindings.model_id = ? AND bindings.enabled = 1 AND channels.enabled = 1", m.ID).
+		Where("channels.protocols LIKE ?", "%,"+protocol+",%").
 		Find(&bindings).Error
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if len(bindings) == 0 {
-		return nil, nil, fmt.Errorf("模型 %s 没有可用上游绑定", modelName)
+		return nil, fmt.Errorf("模型 %s 没有支持 %s 协议的可用上游绑定", modelName, protocol)
 	}
+
 	sel := selector.Get(store.GetSetting(store.KeyRouteStrategy))
 	b, err := sel.Select(bindings)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if b.Channel == nil {
-		return nil, nil, fmt.Errorf("绑定 %d 的上游不存在", b.ID)
+		return nil, fmt.Errorf("绑定 %d 的上游不存在", b.ID)
 	}
-	return b, &m, nil
+	return b, nil
 }
 
 func (s *Service) archiveRequest(dateDir, reqID string, rec *store.RequestLog, body []byte, upURL string, stream bool, header http.Header) {
 	meta := &RequestMeta{
 		RequestID:      reqID,
 		Time:           rec.CreatedAt,
+		Protocol:       rec.Protocol,
+		Endpoint:       rec.Endpoint,
 		Username:       rec.Username,
 		APIKeyName:     rec.APIKeyName,
 		ClientIP:       rec.ClientIP,
@@ -300,7 +272,7 @@ func (s *Service) archiveRequest(dateDir, reqID string, rec *store.RequestLog, b
 	}
 	if header != nil {
 		meta.ClientHeaders = map[string]string{}
-		for _, k := range []string{"User-Agent", "Content-Type", "Accept", "X-Request-Id"} {
+		for _, k := range []string{"User-Agent", "Content-Type", "Accept", "X-Request-Id", "anthropic-version", "anthropic-beta", "OpenAI-Beta"} {
 			if v := header.Get(k); v != "" {
 				meta.ClientHeaders[k] = v
 			}
@@ -325,21 +297,14 @@ func (s *Service) finish(rec *store.RequestLog, dateDir string, status int, resp
 	}
 }
 
-// fail 返回 OpenAI 风格错误，并记录日志。
-func (s *Service) fail(w http.ResponseWriter, rec *store.RequestLog, status int, msg string) {
+// fail 用当前协议的错误格式返回，并记录日志。
+func (s *Service) fail(w http.ResponseWriter, p Protocol, rec *store.RequestLog, status int, msg string) {
 	rec.StatusCode = status
 	rec.ErrorMessage = truncate(msg, 1000)
 	if rec.DurationMs == 0 {
 		rec.DurationMs = time.Since(rec.CreatedAt).Milliseconds()
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"message":    msg,
-			"type":       "gateway_error",
-			"code":       status,
-			"request_id": rec.ID,
-		},
-	})
+	payload := p.ErrorBody(status, msg, rec.ID)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Gateway-Request-Id", rec.ID)
 	w.WriteHeader(status)
@@ -347,21 +312,26 @@ func (s *Service) fail(w http.ResponseWriter, rec *store.RequestLog, status int,
 	s.finish(rec, rec.ArchivePath, status, payload)
 }
 
-// replaceModel 把请求体里的 model 换成上游模型名，其余字段原样保留。
-func replaceModel(body []byte, upstreamModel string) ([]byte, error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return nil, err
+// copyRespHeaders 透传上游响应头（跳过逐跳头与由 Go 自己管理的头）。
+func copyRespHeaders(dst, src http.Header) {
+	skip := map[string]bool{
+		"Connection": true, "Keep-Alive": true, "Transfer-Encoding": true,
+		"Content-Length": true, "Trailer": true, "Upgrade": true,
 	}
-	mv, err := json.Marshal(upstreamModel)
-	if err != nil {
-		return nil, err
+	for k, vs := range src {
+		if skip[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
 	}
-	obj["model"] = mv
-	return json.Marshal(obj)
+	if dst.Get("Content-Type") == "" {
+		dst.Set("Content-Type", "application/json")
+	}
 }
 
-// ssePayload 取出 "data: xxx" 里的 xxx，[DONE] 返回 false。
+// ssePayload 取出 "data: xxx" 里的 xxx；[DONE] 与非 data 行返回 false。
 func ssePayload(line []byte) ([]byte, bool) {
 	if !bytes.HasPrefix(line, []byte("data:")) {
 		return nil, false

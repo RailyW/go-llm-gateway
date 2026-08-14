@@ -2,6 +2,7 @@ package relay
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/rin/go-llm-gateway/backend/internal/relay/selector"
@@ -9,39 +10,171 @@ import (
 )
 
 func TestJoinURL(t *testing.T) {
-	cases := map[string]string{
-		"https://api.openai.com":       "https://api.openai.com/v1/chat/completions",
-		"https://api.openai.com/":      "https://api.openai.com/v1/chat/completions",
-		"https://api.openai.com/v1":    "https://api.openai.com/v1/chat/completions",
-		"https://x.com/proxy/v1/":      "https://x.com/proxy/v1/chat/completions",
-		"http://127.0.0.1:9911":        "http://127.0.0.1:9911/v1/chat/completions",
+	cases := []struct{ base, path, want string }{
+		{"https://api.openai.com", "/v1/chat/completions", "https://api.openai.com/v1/chat/completions"},
+		{"https://api.openai.com/", "/v1/responses", "https://api.openai.com/v1/responses"},
+		{"https://api.openai.com/v1", "/v1/chat/completions", "https://api.openai.com/v1/chat/completions"},
+		{"https://api.anthropic.com", "/v1/messages", "https://api.anthropic.com/v1/messages"},
+		{"http://127.0.0.1:9911/v1/", "/v1/messages", "http://127.0.0.1:9911/v1/messages"},
 	}
-	for base, want := range cases {
-		if got := JoinURL(base, "/v1/chat/completions"); got != want {
-			t.Errorf("JoinURL(%q) = %q, want %q", base, got, want)
+	for _, c := range cases {
+		if got := JoinURL(c.base, c.path); got != c.want {
+			t.Errorf("JoinURL(%q,%q) = %q, want %q", c.base, c.path, got, c.want)
 		}
 	}
 }
 
-func TestReplaceModel(t *testing.T) {
-	in := []byte(`{"model":"public-name","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
-	out, err := replaceModel(in, "upstream-real")
+// 每个协议的入口路径必须唯一，且注册表能反查
+func TestProtocolRegistry(t *testing.T) {
+	seen := map[string]string{}
+	for _, p := range Protocols() {
+		if prev, dup := seen[p.InboundPath()]; dup {
+			t.Errorf("路径冲突 %s: %s 与 %s", p.InboundPath(), prev, p.Name())
+		}
+		seen[p.InboundPath()] = p.Name()
+		if _, err := GetProtocol(p.Name()); err != nil {
+			t.Errorf("GetProtocol(%s): %v", p.Name(), err)
+		}
+	}
+	for _, want := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+		if seen[want] == "" {
+			t.Errorf("缺少端点 %s", want)
+		}
+	}
+}
+
+func TestReplaceModelKeepsBody(t *testing.T) {
+	in := []byte(`{"model":"public-name","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+	for _, p := range Protocols() {
+		out, err := p.ReplaceModel(in, "upstream-real")
+		if err != nil {
+			t.Fatalf("%s: %v", p.Name(), err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["model"] != "upstream-real" {
+			t.Errorf("%s: model = %v", p.Name(), got["model"])
+		}
+		if got["stream"] != true || got["max_tokens"] == nil || got["messages"] == nil {
+			t.Errorf("%s: 其他字段被改动了: %v", p.Name(), got)
+		}
+		model, stream, err := p.ParseRequest(out)
+		if err != nil || model != "upstream-real" || !stream {
+			t.Errorf("%s: ParseRequest = %q %v %v", p.Name(), model, stream, err)
+		}
+	}
+}
+
+// 上游鉴权头：openai 用 Bearer，anthropic 用 x-api-key + anthropic-version
+func TestBuildRequestAuth(t *testing.T) {
+	ch := &store.Channel{BaseURL: "http://up.local", APIKey: "up-key"}
+	req := &ProtoRequest{UpstreamModel: "m", Stream: true, Body: []byte(`{}`), ClientHeader: httptest.NewRequest("POST", "/", nil).Header}
+
+	chat, _ := GetProtocol(ProtocolOpenAIChat)
+	r, err := chat.BuildRequest(t.Context(), ch, req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got map[string]any
-	if err := json.Unmarshal(out, &got); err != nil {
+	if r.URL.String() != "http://up.local/v1/chat/completions" {
+		t.Errorf("url = %s", r.URL)
+	}
+	if r.Header.Get("Authorization") != "Bearer up-key" {
+		t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+	}
+
+	resp, _ := GetProtocol(ProtocolOpenAIResponses)
+	r2, _ := resp.BuildRequest(t.Context(), ch, req)
+	if r2.URL.String() != "http://up.local/v1/responses" {
+		t.Errorf("url = %s", r2.URL)
+	}
+
+	ant, _ := GetProtocol(ProtocolAnthropicMessages)
+	r3, err := ant.BuildRequest(t.Context(), ch, req)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got["model"] != "upstream-real" {
-		t.Errorf("model = %v", got["model"])
+	if r3.URL.String() != "http://up.local/v1/messages" {
+		t.Errorf("url = %s", r3.URL)
 	}
-	if got["stream"] != true {
-		t.Errorf("stream 字段丢失: %v", got)
+	if r3.Header.Get("x-api-key") != "up-key" || r3.Header.Get("Authorization") != "" {
+		t.Errorf("anthropic 鉴权头不对: %v", r3.Header)
 	}
-	if _, ok := got["messages"]; !ok {
-		t.Error("messages 字段丢失")
+	if r3.Header.Get("anthropic-version") != defaultAnthropicVersion {
+		t.Errorf("anthropic-version = %q", r3.Header.Get("anthropic-version"))
 	}
+}
+
+func TestUsagePerProtocol(t *testing.T) {
+	chat, _ := GetProtocol(ProtocolOpenAIChat)
+	var u Usage
+	chat.MergeUsage([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`), &u)
+	if u != (Usage{3, 4, 7}) {
+		t.Errorf("chat usage = %+v", u)
+	}
+
+	// responses：input/output 命名，流式事件里包在 response 下
+	resp, _ := GetProtocol(ProtocolOpenAIResponses)
+	u = Usage{}
+	resp.MergeUsage([]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":5}}}`), &u)
+	if u != (Usage{11, 5, 16}) {
+		t.Errorf("responses usage = %+v", u)
+	}
+
+	// anthropic：input 在 message_start 的 message.usage，output 在 message_delta 顶层 usage
+	ant, _ := GetProtocol(ProtocolAnthropicMessages)
+	u = Usage{}
+	ant.MergeUsage([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":9,"output_tokens":1}}}`), &u)
+	ant.MergeUsage([]byte(`{"type":"content_block_delta","delta":{"text":"hi"}}`), &u)
+	ant.MergeUsage([]byte(`{"type":"message_delta","usage":{"output_tokens":42}}`), &u)
+	if u != (Usage{9, 42, 51}) {
+		t.Errorf("anthropic usage = %+v", u)
+	}
+}
+
+// 网关自身的错误体要符合各协议的格式
+func TestErrorBodyShape(t *testing.T) {
+	chat, _ := GetProtocol(ProtocolOpenAIChat)
+	var oe struct {
+		Error struct{ Message, Type string } `json:"error"`
+	}
+	if err := json.Unmarshal(chat.ErrorBody(404, "boom", "rid"), &oe); err != nil || oe.Error.Message != "boom" {
+		t.Errorf("openai error body: %v %+v", err, oe)
+	}
+
+	ant, _ := GetProtocol(ProtocolAnthropicMessages)
+	var ae struct {
+		Type  string                         `json:"type"`
+		Error struct{ Type, Message string } `json:"error"`
+	}
+	if err := json.Unmarshal(ant.ErrorBody(404, "boom", "rid"), &ae); err != nil || ae.Type != "error" || ae.Error.Message != "boom" {
+		t.Errorf("anthropic error body: %v %+v", err, ae)
+	}
+}
+
+func TestProtocolStorageFormat(t *testing.T) {
+	s, err := relayNormalize(t, []string{ProtocolAnthropicMessages, ProtocolOpenAIChat, ProtocolOpenAIChat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != ",anthropic-messages,openai-chat," {
+		t.Errorf("storage = %q", s)
+	}
+	if got := SplitProtocols(s); len(got) != 2 {
+		t.Errorf("split = %v", got)
+	}
+	if _, err := NormalizeProtocols([]string{"nope"}); err == nil {
+		t.Error("未知协议应报错")
+	}
+	if _, err := NormalizeProtocols(nil); err == nil {
+		t.Error("空列表应报错")
+	}
+}
+
+func relayNormalize(t *testing.T, in []string) (string, error) {
+	t.Helper()
+	return NormalizeProtocols(in)
 }
 
 func TestSSEPayload(t *testing.T) {
@@ -51,19 +184,8 @@ func TestSSEPayload(t *testing.T) {
 	if _, ok := ssePayload([]byte("data: [DONE]")); ok {
 		t.Error("[DONE] 不应被当作载荷")
 	}
-	if _, ok := ssePayload([]byte("event: ping")); ok {
+	if _, ok := ssePayload([]byte("event: message_start")); ok {
 		t.Error("非 data 行不应被当作载荷")
-	}
-}
-
-func TestExtractUsage(t *testing.T) {
-	a := &OpenAIAdapter{}
-	u := a.ExtractUsage([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
-	if u.TotalTokens != 7 || u.PromptTokens != 3 || u.CompletionTokens != 4 {
-		t.Errorf("usage = %+v", u)
-	}
-	if got := a.ExtractUsage([]byte(`{"choices":[]}`)); got.TotalTokens != 0 {
-		t.Errorf("无 usage 时应为零值: %+v", got)
 	}
 }
 

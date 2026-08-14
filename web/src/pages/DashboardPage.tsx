@@ -1,22 +1,24 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { api, type CleanerStatus } from '@/lib/api'
+import { api, type CleanerStatus, type ProtocolInfo } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/misc'
+import { Badge, Label } from '@/components/ui/misc'
 
 type Stats = Record<string, number | CleanerStatus>
 
 export default function DashboardPage() {
   const { user } = useAuth()
   const [stats, setStats] = useState<Stats>({})
+  const [protocols, setProtocols] = useState<ProtocolInfo[]>([])
   const [oldPw, setOldPw] = useState('')
   const [newPw, setNewPw] = useState('')
 
   useEffect(() => {
     api.stats().then(setStats).catch((e) => toast.error((e as Error).message))
+    api.meta().then((m) => setProtocols(m.protocols)).catch(() => {})
   }, [])
 
   const n = (k: string) => (typeof stats[k] === 'number' ? (stats[k] as number) : 0)
@@ -70,21 +72,33 @@ export default function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle>调用方式</CardTitle>
+            <CardDescription>同协议直转：打哪个端点就转到上游同名端点，不做协议翻译</CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-3">
+            <div className="space-y-1.5">
+              {protocols.map((p) => (
+                <div key={p.name} className="flex items-center gap-2 text-xs">
+                  <Badge variant="outline">{p.vendor}</Badge>
+                  <code className="rounded bg-muted px-1.5 py-0.5">POST {base}{p.path}</code>
+                  <span className="text-muted-foreground">{p.label}</span>
+                </div>
+              ))}
+            </div>
             <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs leading-relaxed">
-{`curl ${base}/v1/chat/completions \\
+{`# OpenAI chat/completions
+curl ${base}/v1/chat/completions \\
   -H "Authorization: Bearer sk-你的网关key" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "model": "你录入的模型名",
-    "stream": false,
-    "messages": [{"role":"user","content":"hello"}]
-  }'`}
+  -d '{"model":"你录入的模型名","messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic messages（原生协议，鉴权头也用网关 key）
+curl ${base}/v1/messages \\
+  -H "x-api-key: sk-你的网关key" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{"model":"你录入的模型名","max_tokens":64,
+       "messages":[{"role":"user","content":"hi"}]}'`}
             </pre>
-            <p className="mt-3 text-xs text-muted-foreground">
-              Base URL: <code className="rounded bg-muted px-1">{base}/v1</code> ·
-              仅支持 <code className="rounded bg-muted px-1">/chat/completions</code> 与 <code className="rounded bg-muted px-1">/models</code>
+            <p className="text-xs text-muted-foreground">
+              模型列表：<code className="rounded bg-muted px-1">GET {base}/v1/models</code>
             </p>
           </CardContent>
         </Card>

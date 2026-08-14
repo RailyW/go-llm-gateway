@@ -14,7 +14,7 @@ func (s *Server) getSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"settings":   store.AllSettings(),
 		"strategies": selector.Names(),
-		"types":      relay.AdapterNames(),
+		"protocols":  relay.ProtocolInfos(),
 		"cleaner":    s.cleaner.Status(),
 	})
 }

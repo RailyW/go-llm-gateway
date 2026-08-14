@@ -24,7 +24,7 @@ type credentials struct {
 func (s *Server) meta(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"allow_register": store.GetSettingBool(store.KeyAllowRegister, true),
-		"channel_types":  relay.AdapterNames(),
+		"protocols":      relay.ProtocolInfos(),
 		"strategies":     selector.Names(),
 	})
 }

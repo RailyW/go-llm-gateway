@@ -11,10 +11,17 @@ export interface User {
   enabled: boolean
   created_at: string
 }
+export interface ProtocolInfo {
+  name: string
+  label: string
+  vendor: string
+  path: string
+  default: boolean
+}
 export interface Channel {
   id: number
   name: string
-  type: string
+  protocols: string[]
   base_url: string
   api_key: string
   enabled: boolean
@@ -47,6 +54,8 @@ export interface ApiKey {
 }
 export interface LogItem {
   id: string
+  protocol: string
+  endpoint: string
   username: string
   api_key_name: string
   model_name: string
@@ -102,7 +111,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 const body = (v: unknown) => JSON.stringify(v)
 
 export const api = {
-  meta: () => request<{ allow_register: boolean; channel_types: string[]; strategies: string[] }>('/meta'),
+  meta: () => request<{ allow_register: boolean; protocols: ProtocolInfo[]; strategies: string[] }>('/meta'),
   login: (username: string, password: string) =>
     request<{ token: string; user: User }>('/auth/login', { method: 'POST', body: body({ username, password }) }),
   register: (username: string, password: string) =>
@@ -141,7 +150,12 @@ export const api = {
   logArchive: (id: string) => request<{ request: string; response: string }>(`/logs/${id}/archive`),
 
   settings: () =>
-    request<{ settings: Record<string, string>; strategies: string[]; types: string[]; cleaner: CleanerStatus }>('/settings'),
+    request<{
+      settings: Record<string, string>
+      strategies: string[]
+      protocols: ProtocolInfo[]
+      cleaner: CleanerStatus
+    }>('/settings'),
   updateSettings: (v: Record<string, string>) =>
     request<{ settings: Record<string, string> }>('/settings', { method: 'PUT', body: body(v) }),
   runCleanup: () => request<{ ok: boolean; cleaner: CleanerStatus }>('/settings/cleanup', { method: 'POST' }),
