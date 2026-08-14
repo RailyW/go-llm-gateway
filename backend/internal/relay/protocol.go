@@ -30,6 +30,10 @@ type Usage struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	// Raw 上游给的原始 usage 对象（多帧合并后），原样落进 logs.usage(jsonb)。
+	// 归一化只取了三个数字，但各家 usage 里还有 cache/reasoning 之类的字段，
+	// 不该为它们逐个建列。
+	Raw json.RawMessage
 }
 
 // ProtoRequest 一次转发的请求上下文。Body 已把 model 换成上游模型名，其余原样。
@@ -230,6 +234,7 @@ func mergeUsage(payload []byte, acc *Usage, k usageKeys, nests ...string) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return
 	}
+	acc.Raw = mergeRawUsage(acc.Raw, raw)
 	num := func(key string) int {
 		if v, ok := fields[key]; ok {
 			if n, err := v.Int64(); err == nil {
@@ -251,4 +256,27 @@ func mergeUsage(payload []byte, acc *Usage, k usageKeys, nests ...string) {
 	} else if acc.PromptTokens+acc.CompletionTokens > 0 {
 		acc.TotalTokens = acc.PromptTokens + acc.CompletionTokens
 	}
+}
+
+// mergeRawUsage 把新一帧的 usage 覆盖合并到已累积的 usage 上。
+//
+// 为什么不能直接取最后一帧：anthropic 流式把 usage 拆开给——
+// input_tokens 只在 message_start 出现，output_tokens 在 message_delta 里更新。
+// 取最后一帧会把 input_tokens 丢掉，逐 key 合并才能拿到完整的 usage 原文。
+func mergeRawUsage(old, next json.RawMessage) json.RawMessage {
+	if len(old) == 0 {
+		return append(json.RawMessage(nil), next...)
+	}
+	var a, b map[string]json.RawMessage
+	if json.Unmarshal(old, &a) != nil || json.Unmarshal(next, &b) != nil {
+		return append(json.RawMessage(nil), next...)
+	}
+	for k, v := range b {
+		a[k] = v
+	}
+	merged, err := json.Marshal(a)
+	if err != nil {
+		return append(json.RawMessage(nil), next...)
+	}
+	return merged
 }

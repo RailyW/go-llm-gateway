@@ -159,13 +159,13 @@ func (r *Registry) build() (*Snapshot, error) {
 	if err := r.db.Find(&channels).Error; err != nil {
 		return nil, err
 	}
-	if err := r.db.Where("enabled = 1").Find(&chKeys).Error; err != nil {
+	if err := r.db.Where("enabled").Find(&chKeys).Error; err != nil {
 		return nil, err
 	}
 	if err := r.db.Find(&models).Error; err != nil {
 		return nil, err
 	}
-	if err := r.db.Where("enabled = 1").Find(&bindings).Error; err != nil {
+	if err := r.db.Where("enabled").Find(&bindings).Error; err != nil {
 		return nil, err
 	}
 

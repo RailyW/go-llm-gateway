@@ -32,45 +32,74 @@
 请求体除了把 `model` 换成上游模型名之外**原样透传**，响应（含 SSE 流）**原样回吐**。
 上游录入时勾选它支持哪些协议端点；路由时只有勾了对应协议的绑定才参与选择。
 
+## 存储选型：PostgreSQL + 磁盘归档
+
+**结构化数据进 PostgreSQL，请求/响应原文进磁盘文件**，这是两类完全不同的数据：
+
+| | 控制面（配置） | 观测面（日志） | 原文归档 |
+| --- | --- | --- | --- |
+| 存在哪 | PG | PG | 磁盘文件 `data/archive/` |
+| 量级 | 几百行 | 随流量线性增长 | **增长最快** |
+| 要求 | 事务、唯一约束、外键、改完立刻生效 | 追加即忘、时间窗口聚合、TTL | 能整体冷备/迁对象存储 |
+
+原文**故意不进数据库**：它是膨胀最快的部分，放进去会拖着数据库一起变大，
+而单独放文件就能按天目录直接打包搬走、或换成对象存储，跟数据库解耦。
+
+用 PG 而不是 sqlite/MySQL 的具体原因：
+
+- **多实例**。sqlite 只能单实例（全局单写者）；这是离开它的首要理由。
+- **`jsonb`**。网关里有一批「结构不稳定、又不值得单独建列」的数据。典型是
+  **上游返回的原始 usage 对象**：我们归一化了 3 个 token 数字，但 anthropic 还给
+  `cache_creation_input_tokens`、responses 还给 `reasoning_tokens`，各家都在加。
+  这些原样存 `request_logs.usage`（jsonb），要查就 `usage->>'reasoning_tokens'`，
+  不用每来一个字段就改表。`channels.config` 同理，留给上游的扩展配置。
+- **按事务控制持久化强度**。见下面的 `synchronous_commit`。
+- **外键约束是打开的**。sqlite 下我关掉了（它加列要重建表，开外键会让迁移失败），PG 没这问题。
+  注意 `request_logs` 上**故意没有外键**：日志是反规范化的历史快照，上游删了记录也要留下。
+
 ## 性能：热路径不落库
 
 早期实现每个请求在 handler 里同步做 7 次 SELECT + 2 次文件写 + 3 次写事务（1 条日志 INSERT +
-2 条 `last_used_at` UPDATE）。sqlite 是**全局单写者**且每次 commit 一次 fsync，于是：
+2 条 `last_used_at` UPDATE）。当时是 sqlite——**全局单写者**且每次 commit 一次 fsync，于是：
 
 - 吞吐被压在 ~220 RPS，且 **c=1 和 c=50 的 RPS 一样**（说明是全局串行，加并发没用）
 - p99 2.5s、单条 INSERT 最慢 4.4s（`busy_timeout` 是 5s，再高一点就开始静默丢日志）
 - 网关自己记的 `duration_ms` 却是 p50=0ms —— 时间全花在响应发出**之后**的落库上
 
-现在的做法（同一台机器、同一个空转上游、非流式最小请求）：
+现在（同机、空转上游、非流式最小请求；PG 在本机 docker 里）：
 
 | 场景 | RPS | p50 | p99 | max |
 | --- | --- | --- | --- | --- |
 | 直连上游（基线，不经网关） | 59,401 | 0.58ms | 4.6ms | 11ms |
-| 改造前 c=50 | 219 | 41ms | 2.50s | 5.05s |
-| **改造后 c=50** | **16,698** | **2.2ms** | **21.9ms** | 25.5ms |
-| **改造后 c=200** | **20,263** | 8.5ms | 31.1ms | 52.1ms |
-| 改造前 c=1 | 225 | 4.26ms | 6.9ms | 9.9ms |
-| **改造后 c=1** | **4,270** | **0.18ms** | 1.9ms | 3.2ms |
+| 同步落库时代 c=50（sqlite） | 219 | 41ms | 2.50s | 5.05s |
+| **现在 c=1** | **4,156** | **0.20ms** | 0.93ms | 2.6ms |
+| **现在 c=50** | **17,413** | 2.27ms | 12.3ms | 22.7ms |
+| **现在 c=200** | **22,478** | 7.87ms | 24.0ms | 38.7ms |
 
-吞吐 **76 倍**，p99 好 **114 倍**，单请求净开销 4.26ms → 0.18ms。四件事：
+吞吐约 **80 倍**，p99 好 **100 倍**。注意这个数字对 LLM 网关**没有实际意义**——真实请求要占着
+上游连接好几秒，单实例几百 RPS 就到顶了。它的意义只是证明**落库不再是瓶颈**。四件事：
 
-1. **`synchronous=NORMAL`**（WAL 下每次 commit 不再 fsync）。实测单条写入 1.575ms → 0.177ms（9 倍）。
-   代价：机器掉电/内核崩溃可能丢最近几个事务，不会损坏数据库——对请求日志这类观测数据划算。
+1. **`SET LOCAL synchronous_commit = off`，只对日志落库那个事务生效**。日志是观测数据，
+   丢最近几个事务可以接受，换来不必等 WAL 落盘确认；而配置/用户的写入仍然是默认的
+   `on`。（sqlite 的 `synchronous=NORMAL` 是全库开关，做不到这种区分——这是 PG 的净胜项）
 2. **日志与归档异步批量落库**（`internal/sink`）。请求只把 Entry 丢进有界队列；后台协程攒批，
-   在**单个事务**里批量 INSERT，一批只有一次 fsync。实测批量 0.093ms/条 vs 逐条 1.575ms（17 倍）。
+   在**单个事务**里批量 INSERT。「每请求 3 个事务」变成「每批 1 个事务」。
+   注意 PG 单条语句最多 65535 个绑定参数，`RequestLog` 有 ~30 列，所以事务内还要按
+   500 行切句（`insertChunk`），这跟用户可调的攒批条数是两件事。
 3. **`last_used_at` 合并**。这字段是 last-write-wins，天生可合并：每批只发 1 条
-   `UPDATE ... WHERE id IN (...)`，而不是每请求 2 条。写事务从 3/请求降到 3/批。
+   `UPDATE ... WHERE id IN (...)`，而不是每请求 2 条。
 4. **配置内存快照**（`internal/registry`）。网关 key、用户、归属、模型、绑定、上游 key
    全量缓存，用 `atomic.Pointer` 发布，热路径**零查询零锁**。任何管理 API 的写操作成功后
    由中间件同步重建快照（保证"改完立刻生效"），另有 30s 兜底刷新。
 
 ### 异步落库的代价（都是显式选择）
 
-- **队列满会丢日志**（不阻塞转发）。实测落库上限约 **8k~13k 条/s**（瓶颈是 GORM 每行序列化，
-  加大攒批帮助不大）；超过就开始丢。丢弃数、队列占用、上批耗时全部显示在概览页
-  「异步落库管道」卡片里 —— **隐性丢数据是不可接受的，所以必须可见**。
+- **队列满会丢日志**（不阻塞转发）。实测落库上限约 **1.4 万条/s**，超过就开始丢
+  （压测里 25,500 个请求丢了 6,660 条日志，但**转发全部成功**）。
+  丢弃数、队列占用、上批耗时全部显示在概览页「异步落库管道」卡片里
+  —— **隐性丢数据是不可接受的，所以必须可见**。
 - **日志有可见延迟**（默认 ≤200ms 或攒满 200 条）。攒批间隔/条数在设置页可调。
-- **崩溃丢最后一批**。`SIGTERM` 优雅退出会先停 HTTP、再把队列刷完（实测入队 421 / 落库 421 / 丢弃 0）；
+- **崩溃丢最后一批**。`SIGTERM` 优雅退出会先停 HTTP、再把队列刷完（实测入队/落库/丢弃 = 421/421/0）；
   `kill -9` 则丢最后一批。
 - **写顺序**：每批先写归档文件、再插日志行，保证「日志里能看到的请求，原文一定已存在」。
 
@@ -81,7 +110,7 @@
 进程 RSS 仅 +19MB，归档文件完整 12.2MB 落盘。
 
 概览页的统计只按**时间窗口**（1 小时 / 1 天）查询，不做全表 `COUNT/SUM`——
-logs 表会一直增长，全表扫描的首页迟早会拖垮。更长周期的统计等以后做小时级 rollup。
+logs 表会一直增长，全表扫描的首页迟早会拖垮。
 
 ## 功能范围
 
@@ -105,10 +134,15 @@ logs 表会一直增长，全表扫描的首页迟早会拖垮。更长周期的
 ## 快速开始
 
 ```bash
-# 依赖：Go 1.22+ / Node 20+
+# 依赖：Go 1.22+ / Node 20+ / 一个 PostgreSQL 14+
+make db-up      # 用 docker compose 起 PG（库 gateway / gateway_test，账号 gateway/gateway）
+cp .env.example .env   # 可选：改端口/密码/密钥；真实环境变量优先级高于 .env
 make build      # 构建前端并打包成单个二进制 bin/gateway（前端已 embed）
 ./bin/gateway   # 访问 http://localhost:8080 ，用 admin / admin 登录
 ```
+
+已经有 PG 的话不用 `make db-up`，建个库然后设 `GATEWAY_DB_*`（或整条 `GATEWAY_DB_DSN`）即可。
+表结构由 `AutoMigrate` 自动创建，首次启动会写入默认归属 `default` 与管理员 `admin/admin`。
 
 开发模式（前后端分离热更新）：
 
@@ -146,8 +180,10 @@ curl http://localhost:8080/v1/messages \
 ```
 backend/
   cmd/server/main.go              启动、优雅退出
-  internal/config/                环境变量配置
-  internal/store/                 GORM 模型 / sqlite / 设置 KV（含默认值与缓存）
+  internal/config/                环境变量配置（含极简 .env 加载）
+  internal/store/                 GORM 模型 / PostgreSQL / 设置 KV（含默认值与缓存）
+    jsonb.go                      ★ jsonb 列的最小封装（原始 JSON 直存直取）
+  internal/storetest/             测试用的一次性 PG 环境（每个测试一个独立 schema）
   internal/auth/                  JWT、bcrypt、sk- key 生成
   internal/relay/
     protocol.go                   ★ 端点协议接口 + 注册表 + 共用小工具
@@ -169,7 +205,7 @@ scripts/mock_upstream.py          本地 mock 上游
 
 ## 数据与文件
 
-- sqlite：`data/gateway.db`（纯 Go 驱动，无需 CGO）
+- 结构化数据：PostgreSQL（`AutoMigrate` 建表，外键约束打开）
 - 归档原文：`data/archive/<YYYY-MM-DD>/<request-id>.request.json` 与 `<request-id>.response.txt`
   - `request.json` 含元信息（用户、key、模型、上游 URL）+ 客户端原始 body
   - `response.txt` 非流式为完整响应体，流式为完整 SSE 文本（边转发边追加写，单文件上限 32MB 后截断）
@@ -181,18 +217,27 @@ scripts/mock_upstream.py          本地 mock 上游
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `GATEWAY_PORT` | `8080` | 监听端口 |
-| `GATEWAY_DATA_DIR` | `./data` | 数据目录 |
-| `GATEWAY_DB_PATH` | `<data>/gateway.db` | sqlite 路径 |
+| `GATEWAY_DATA_DIR` | `./data` | 数据目录（只存原文归档） |
 | `GATEWAY_ARCHIVE_DIR` | `<data>/archive` | 归档目录 |
 | `GATEWAY_JWT_SECRET` | `dev-insecure-...` | **生产务必修改** |
 | `GATEWAY_ADMIN_USER/PASS` | `admin` / `admin` | 初始管理员（仅无 admin 时创建） |
 | `GATEWAY_ALLOW_REGISTER` | `true` | 是否允许自助注册（也可在设置页改） |
 | `GATEWAY_LOG_QUEUE_SIZE` | `8192` | 异步落库队列容量（满了丢日志，不阻塞转发） |
+| `GATEWAY_DB_DSN` | 由下面分量拼出 | 整条 PG 连接串，给了就优先用 |
+| `GATEWAY_DB_HOST` / `_PORT` | `127.0.0.1` / `5432` | |
+| `GATEWAY_DB_USER` / `_PASSWORD` / `_NAME` | `gateway` / `gateway` / `gateway` | |
+| `GATEWAY_DB_SSLMODE` | `disable` | |
+| `GATEWAY_DB_TIMEZONE` | `Asia/Shanghai` | |
+| `GATEWAY_DB_MAX_OPEN` / `_MAX_IDLE` | `32` / `8` | 连接池；别超过 PG 的 `max_connections` |
+| `GATEWAY_TEST_DSN` | 无 | `go test` 用的库；不设则跳过需要数据库的测试 |
+
+启动时会读当前目录的 `.env`（见 `.env.example`），**已存在的真实环境变量不会被覆盖**。
 
 WebUI 可改的运行时配置：归档保留天数、日志保留天数、清理间隔、上游绑定路由策略、**上游 key 选择策略**、
 **新用户默认归属**、上游超时、注册开关、**异步落库攒批间隔/条数**。
 
-老库升级说明：启动时若发现旧的 `channels.api_key` 列，会自动把它迁成 `default` 归属下的一把 `ChannelKey` 并删除该列。
+`data/` 目录现在只放原文归档，数据库不在里面（早期版本是 sqlite `data/gateway.db`，已彻底移除，
+不提供 sqlite → PG 的数据迁移）。
 
 ## 扩展点
 
@@ -220,10 +265,15 @@ type Protocol interface {
 
 **加一个上游选择策略**（如轮询、最少失败）：在 `internal/relay/selector/` 实现 `Selector` 并 `Register`。
 
+**日志表按天分区**：`request_logs` 现在是普通表，保留策略靠 `DELETE`。上量后应改成
+`PARTITION BY RANGE (created_at)` + 按天 `DROP PARTITION`——瞬间完成、不产生死行、不用等 autovacuum。
+`AutoMigrate` 建不了分区表，需要手写 DDL + 预建分区（或上 `pg_partman`），所以先留作扩展点。
+
 **把落库换成 Redis / ClickHouse**：`sink.Sink` 是接口（`Submit` / `Stats` / `Close`），
 换一个 Redis Stream 实现即可，请求侧代码不动。判据是**要不要多实例**：单实例下进程内队列
 比 Redis 少一次 RTT、少一个可用性依赖，而 Redis 默认 AOF everysec 的丢失窗口跟攒批是同量级。
 真正需要 Redis 的场景是：多实例共享缓存失效/限流计数、配额原子扣减（这类**必须同步**，不能进异步管道）。
+日志真到亿级、要做用量报表时，把 `request_logs` 单独挪去 ClickHouse（配置仍留 PG）。
 
 **加一个上游 key 选择策略**（如按会话亲和、按剩余额度）：在 `internal/relay/keyselector/` 实现 `Selector` 并 `Register`。
 `Context` 里已经带了 channel/group/user/网关key/模型/协议/`AffinityKey`，够做亲和性。

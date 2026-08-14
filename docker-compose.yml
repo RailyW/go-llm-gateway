@@ -1,0 +1,33 @@
+# 只为本项目起一个 PostgreSQL。已经有 PG 的话不用它，直接设 GATEWAY_DB_* 或 GATEWAY_DB_DSN 即可。
+#
+#   docker compose up -d          起库
+#   docker compose down           停（数据保留在 volume 里）
+#   docker compose down -v        连数据一起删
+#
+# 注意：Redis 暂时不需要。它该干的是限流/配额计数与多实例的配置快照失效广播，
+# 那是独立一轮的事，等真用到再加进来，避免起一堆用不上的组件。
+services:
+  postgres:
+    image: postgres:16
+    container_name: gateway-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 顺手把测试库建出来（go test 用，每个测试在里面建独立 schema）
+      - ./scripts/pg-init-test-db.sh:/docker-entrypoint-initdb.d/10-test-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

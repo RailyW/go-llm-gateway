@@ -26,9 +26,11 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	cfg := config.Load()
 
-	db, err := store.Open(cfg.DBPath, cfg.AdminUser, cfg.AdminPass)
+	db, err := store.Open(cfg.DSN, cfg.AdminUser, cfg.AdminPass, store.Options{
+		MaxOpen: cfg.DBMaxOpen, MaxIdle: cfg.DBMaxIdle,
+	})
 	if err != nil {
-		log.Fatalf("初始化数据库失败: %v", err)
+		log.Fatalf("初始化数据库失败: %v (DSN %s)", err, config.SafeDSN(cfg.DSN))
 	}
 	if !cfg.AllowRegister {
 		_ = store.SetSettings(map[string]string{store.KeyAllowRegister: "false"})
@@ -66,6 +68,7 @@ func main() {
 
 	go func() {
 		log.Printf("[boot] 监听 http://localhost:%s  (数据目录 %s, 前端内嵌=%v)", cfg.Port, cfg.DataDir, webassets.Built())
+		log.Printf("[boot] 数据库 %s (连接池 %d/%d)", config.SafeDSN(cfg.DSN), cfg.DBMaxIdle, cfg.DBMaxOpen)
 		log.Printf("[boot] 网关端点 POST http://localhost:%s/v1/chat/completions | /v1/responses | /v1/messages", cfg.Port)
 		log.Printf("[boot] 异步落库队列容量 %d", cfg.LogQueueSize)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

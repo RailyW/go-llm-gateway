@@ -20,7 +20,7 @@ func (s *Server) listGatewayModels(c *gin.Context) {
 		Select("models.name as name, channels.protocols as protocols").
 		Joins("JOIN bindings ON bindings.model_id = models.id").
 		Joins("JOIN channels ON channels.id = bindings.channel_id").
-		Where("models.enabled = 1 AND bindings.enabled = 1 AND channels.enabled = 1").
+		Where("models.enabled AND bindings.enabled AND channels.enabled").
 		Order("models.name asc").
 		Scan(&rows).Error
 	if err != nil {

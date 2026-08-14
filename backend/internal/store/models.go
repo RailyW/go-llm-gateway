@@ -51,6 +51,10 @@ type Channel struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 
+	// Config 上游的扩展配置（额外请求头、代理、超时覆盖……）。
+	// 这类东西每家上游都不一样、还会长，不值得逐个建列，直接放 jsonb。
+	Config JSONB `gorm:"type:jsonb" json:"config,omitempty"`
+
 	// Keys 该上游的所有 key（按归属划分），列表接口里带出来
 	Keys []ChannelKey `gorm:"foreignKey:ChannelID" json:"keys,omitempty"`
 }
@@ -132,31 +136,40 @@ type APIKey struct {
 // RequestLog 一次网关调用的结构化记录。ID 即 request id，
 // 与 archive 目录下的原文文件名一一对应。
 type RequestLog struct {
-	ID               string    `gorm:"primarykey;size:36" json:"id"`
-	Protocol         string    `gorm:"size:32;index" json:"protocol"` // openai-chat / openai-responses / anthropic-messages
-	Endpoint         string    `gorm:"size:64" json:"endpoint"`       // 客户端请求的路径
-	UserID           uint      `gorm:"index" json:"user_id"`
-	Username         string    `gorm:"size:64" json:"username"`
-	GroupID          uint      `gorm:"index" json:"group_id"`
-	GroupName        string    `gorm:"size:64" json:"group_name"`
-	APIKeyID         uint      `gorm:"index" json:"api_key_id"`
-	APIKeyName       string    `gorm:"size:128" json:"api_key_name"`
-	ModelName        string    `gorm:"size:128;index" json:"model_name"`
-	ChannelID        uint      `json:"channel_id"`
-	ChannelName      string    `gorm:"size:128" json:"channel_name"`
-	UpstreamModel    string    `gorm:"size:128" json:"upstream_model"`
-	ChannelKeyID     uint      `json:"channel_key_id"`
-	ChannelKeyName   string    `gorm:"size:128" json:"channel_key_name"`
-	Stream           bool      `json:"stream"`
-	StatusCode       int       `json:"status_code"`
-	PromptTokens     int       `json:"prompt_tokens"`
-	CompletionTokens int       `json:"completion_tokens"`
-	TotalTokens      int       `json:"total_tokens"`
-	DurationMs       int64     `json:"duration_ms"`
-	ClientIP         string    `gorm:"size:64" json:"client_ip"`
-	ErrorMessage     string    `gorm:"size:1024" json:"error_message"`
-	ArchivePath      string    `gorm:"size:255" json:"archive_path"` // 相对 archive 根目录
-	CreatedAt        time.Time `gorm:"index" json:"created_at"`
+	ID               string `gorm:"primarykey;size:36" json:"id"`
+	Protocol         string `gorm:"size:32;index" json:"protocol"` // openai-chat / openai-responses / anthropic-messages
+	Endpoint         string `gorm:"size:64" json:"endpoint"`       // 客户端请求的路径
+	UserID           uint   `gorm:"index:idx_log_user_time,priority:1" json:"user_id"`
+	Username         string `gorm:"size:64" json:"username"`
+	GroupID          uint   `gorm:"index" json:"group_id"`
+	GroupName        string `gorm:"size:64" json:"group_name"`
+	APIKeyID         uint   `gorm:"index" json:"api_key_id"`
+	APIKeyName       string `gorm:"size:128" json:"api_key_name"`
+	ModelName        string `gorm:"size:128;index" json:"model_name"`
+	ChannelID        uint   `json:"channel_id"`
+	ChannelName      string `gorm:"size:128" json:"channel_name"`
+	UpstreamModel    string `gorm:"size:128" json:"upstream_model"`
+	ChannelKeyID     uint   `json:"channel_key_id"`
+	ChannelKeyName   string `gorm:"size:128" json:"channel_key_name"`
+	Stream           bool   `json:"stream"`
+	StatusCode       int    `json:"status_code"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
+	DurationMs       int64  `json:"duration_ms"`
+	ClientIP         string `gorm:"size:64" json:"client_ip"`
+	ErrorMessage     string `gorm:"size:1024" json:"error_message"`
+	ArchivePath      string `gorm:"size:255" json:"archive_path"` // 相对 archive 根目录
+	// CreatedAt 两个索引：
+	//   idx_log_created    列表页按时间倒序翻页、清理服务按时间删
+	//   idx_log_user_time  普通用户的「我的用量」时间窗口查询（user_id, created_at）
+	CreatedAt time.Time `gorm:"index:idx_log_created,sort:desc;index:idx_log_user_time,priority:2,sort:desc" json:"created_at"`
+
+	// Usage 上游返回的**原始 usage 对象**。上面三个 token 字段是归一化后的结果，
+	// 但各家还在往 usage 里加东西（anthropic 的 cache_creation_input_tokens、
+	// responses 的 reasoning_tokens、cached_tokens……），逐个建列会让表结构
+	// 一直被动跟着上游变。原样存 jsonb，要查就 usage->>'reasoning_tokens'。
+	Usage JSONB `gorm:"type:jsonb" json:"usage,omitempty"`
 }
 
 // Setting 简单 KV 配置表，供 WebUI 修改（如归档保留天数）。

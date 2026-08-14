@@ -1,10 +1,10 @@
 package registry
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/RailyW/go-llm-gateway/backend/internal/store"
+	"github.com/RailyW/go-llm-gateway/backend/internal/storetest"
 	"gorm.io/gorm"
 )
 
@@ -15,10 +15,7 @@ import (
 //	渠道3 已禁用
 func seed(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"), "admin", "admin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.New(t)
 	must := func(err error) {
 		t.Helper()
 		if err != nil {
@@ -59,12 +56,18 @@ func seed(t *testing.T) *gorm.DB {
 	return db
 }
 
-func TestSnapshotCaller(t *testing.T) {
-	r, err := New(seed(t))
+// mustNew 建快照，出错直接 Fatal（别让 nil 快照往下走变成 panic）
+func mustNew(t *testing.T, db *gorm.DB) *Registry {
+	t.Helper()
+	r, err := New(db)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("构建配置快照失败: %v", err)
 	}
-	snap := r.Get()
+	return r
+}
+
+func TestSnapshotCaller(t *testing.T) {
+	snap := mustNew(t, seed(t)).Get()
 
 	c, ok := snap.Caller("sk-dev")
 	if !ok {
@@ -85,8 +88,7 @@ func TestSnapshotCaller(t *testing.T) {
 }
 
 func TestSnapshotKeysFilter(t *testing.T) {
-	r, _ := New(seed(t))
-	snap := r.Get()
+	snap := mustNew(t, seed(t)).Get()
 
 	if got := len(snap.ChannelKeys(1, 2)); got != 2 {
 		t.Errorf("渠道1/研发部 可用 key = %d, want 2（禁用那把要排除）", got)
@@ -109,8 +111,7 @@ func TestSnapshotKeysFilter(t *testing.T) {
 }
 
 func TestSnapshotModelBindings(t *testing.T) {
-	r, _ := New(seed(t))
-	snap := r.Get()
+	snap := mustNew(t, seed(t)).Get()
 
 	m, ok := snap.Model("m1")
 	if !ok || !m.Enabled {
@@ -139,7 +140,7 @@ func TestSnapshotModelBindings(t *testing.T) {
 // 改库后 Invalidate 必须能立刻反映出来
 func TestInvalidate(t *testing.T) {
 	db := seed(t)
-	r, _ := New(db)
+	r := mustNew(t, db)
 	if !r.Get().HasKeyFor(1, 2) {
 		t.Fatal("初始应有 key")
 	}

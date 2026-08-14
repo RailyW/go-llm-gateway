@@ -114,10 +114,13 @@ func TestBuildRequestAuth(t *testing.T) {
 }
 
 func TestUsagePerProtocol(t *testing.T) {
+	// tokens 只比三个归一化后的数字；Raw 单独校验（它是 []byte，结构体不可比较）
+	tokens := func(u Usage) [3]int { return [3]int{u.PromptTokens, u.CompletionTokens, u.TotalTokens} }
+
 	chat, _ := GetProtocol(ProtocolOpenAIChat)
 	var u Usage
 	chat.MergeUsage([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`), &u)
-	if u != (Usage{3, 4, 7}) {
+	if tokens(u) != [3]int{3, 4, 7} {
 		t.Errorf("chat usage = %+v", u)
 	}
 
@@ -125,7 +128,7 @@ func TestUsagePerProtocol(t *testing.T) {
 	resp, _ := GetProtocol(ProtocolOpenAIResponses)
 	u = Usage{}
 	resp.MergeUsage([]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":5}}}`), &u)
-	if u != (Usage{11, 5, 16}) {
+	if tokens(u) != [3]int{11, 5, 16} {
 		t.Errorf("responses usage = %+v", u)
 	}
 
@@ -135,8 +138,37 @@ func TestUsagePerProtocol(t *testing.T) {
 	ant.MergeUsage([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":9,"output_tokens":1}}}`), &u)
 	ant.MergeUsage([]byte(`{"type":"content_block_delta","delta":{"text":"hi"}}`), &u)
 	ant.MergeUsage([]byte(`{"type":"message_delta","usage":{"output_tokens":42}}`), &u)
-	if u != (Usage{9, 42, 51}) {
+	if tokens(u) != [3]int{9, 42, 51} {
 		t.Errorf("anthropic usage = %+v", u)
+	}
+}
+
+// 原始 usage 对象要原样留下来（落进 logs.usage jsonb），
+// 归一化只取三个数字，各家自己的扩展字段不能丢。
+func TestUsageRawPreserved(t *testing.T) {
+	ant, _ := GetProtocol(ProtocolAnthropicMessages)
+	var u Usage
+	ant.MergeUsage([]byte(`{"usage":{"input_tokens":9,"output_tokens":2,`+
+		`"cache_creation_input_tokens":100,"cache_read_input_tokens":7}}`), &u)
+
+	var got map[string]int
+	if err := json.Unmarshal(u.Raw, &got); err != nil {
+		t.Fatalf("Raw 不是合法 JSON: %v (%s)", err, u.Raw)
+	}
+	if got["cache_creation_input_tokens"] != 100 || got["cache_read_input_tokens"] != 7 {
+		t.Errorf("扩展字段丢了: %v", got)
+	}
+
+	// 流式要逐帧**合并**而不是取最后一帧：anthropic 的 input_tokens 只在
+	// message_start 出现，output_tokens 在 message_delta 里更新，取最后一帧会丢 input。
+	u = Usage{}
+	ant.MergeUsage([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":9,"cache_read_input_tokens":3}}}`), &u)
+	ant.MergeUsage([]byte(`{"type":"message_delta","usage":{"output_tokens":42}}`), &u)
+	if err := json.Unmarshal(u.Raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["input_tokens"] != 9 || got["output_tokens"] != 42 || got["cache_read_input_tokens"] != 3 {
+		t.Errorf("流式 Raw 应该是各帧合并的结果: %v", got)
 	}
 }
 

@@ -206,6 +206,7 @@ func (s *Service) pipeBody(w http.ResponseWriter, resp *http.Response, c *call, 
 	var u Usage
 	c.proto.MergeUsage(raw, &u)
 	c.rec.PromptTokens, c.rec.CompletionTokens, c.rec.TotalTokens = u.PromptTokens, u.CompletionTokens, u.TotalTokens
+	c.rec.Usage = store.JSONB(u.Raw)
 	c.rec.StatusCode = resp.StatusCode
 	if resp.StatusCode >= 400 {
 		c.rec.ErrorMessage = truncate(string(raw), 1000)
@@ -266,6 +267,7 @@ func (s *Service) pipeStream(w http.ResponseWriter, resp *http.Response, c *call
 	}
 
 	c.rec.PromptTokens, c.rec.CompletionTokens, c.rec.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
+	c.rec.Usage = store.JSONB(usage.Raw)
 	c.rec.DurationMs = time.Since(start).Milliseconds()
 }
 

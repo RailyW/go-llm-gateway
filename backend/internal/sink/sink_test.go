@@ -9,17 +9,14 @@ import (
 
 	"github.com/RailyW/go-llm-gateway/backend/internal/archive"
 	"github.com/RailyW/go-llm-gateway/backend/internal/store"
+	"github.com/RailyW/go-llm-gateway/backend/internal/storetest"
 	"gorm.io/gorm"
 )
 
 func setup(t *testing.T) (*gorm.DB, *archive.Archiver, string) {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "t.db"), "admin", "admin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := filepath.Join(dir, "archive")
+	db := storetest.New(t)
+	root := filepath.Join(t.TempDir(), "archive")
 	return db, archive.NewArchiver(root), root
 }
 
@@ -105,14 +102,22 @@ func TestBatchCoalescesLastUsedAt(t *testing.T) {
 	_ = store.SetSettings(map[string]string{store.KeyLogFlushIntervalMs: "20", store.KeyLogFlushBatch: "500"})
 
 	db.Create(&store.APIKey{UserID: 1, Name: "k", Key: "sk-coalesce", Enabled: true})
-	db.Create(&store.ChannelKey{ChannelID: 1, GroupID: 1, Name: "ck", Key: "up", Weight: 1, Enabled: true})
+	// 外键是打开的：先把上游建出来，channel_keys 才能引用它
+	ch := store.Channel{Name: "c", Protocols: ",openai-chat,", BaseURL: "http://x", Enabled: true}
+	if err := db.Create(&ch).Error; err != nil {
+		t.Fatal(err)
+	}
+	ck0 := store.ChannelKey{ChannelID: ch.ID, GroupID: 1, Name: "ck", Key: "up", Weight: 1, Enabled: true}
+	if err := db.Create(&ck0).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	s := NewBatch(db, arch, 1024)
 	s.Start()
 	for i := 0; i < 100; i++ {
 		e := entry(idOf(i))
 		e.TouchGatewayKeyID = 1
-		e.TouchChannelKeyID = 1
+		e.TouchChannelKeyID = ck0.ID
 		s.Submit(e)
 	}
 	if err := s.Close(context.Background()); err != nil {
@@ -125,7 +130,7 @@ func TestBatchCoalescesLastUsedAt(t *testing.T) {
 		t.Error("网关 key 的 last_used_at 应被刷新")
 	}
 	var ck store.ChannelKey
-	db.First(&ck, 1)
+	db.First(&ck, ck0.ID)
 	if ck.LastUsedAt == nil {
 		t.Error("上游 key 的 last_used_at 应被刷新")
 	}

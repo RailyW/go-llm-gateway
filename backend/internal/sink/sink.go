@@ -1,12 +1,15 @@
 // Package sink 把「日志落库 + 原文归档」从请求热路径上摘下来。
 //
-// 为什么需要它：sqlite 是全局单写者，且每次 commit 一次 fsync（实测每条 INSERT 1.5ms，
-// 加上两条 last_used_at UPDATE 一共约 3.7ms/请求）。这些写操作原先同步发生在 handler 里，
-// 直接把网关吞吐压在 ~220 RPS、p99 拉到 2.5s。
+// 为什么需要它：原先每个请求同步做 1 条日志 INSERT + 2 条 last_used_at UPDATE，
+// 也就是 3 个写事务；每个事务都要等一次 WAL 落盘确认 + 一次网络往返。
+// 这把网关吞吐压在几百 RPS、p99 拉到秒级（当时是 sqlite，全局单写者，更惨：~220 RPS / p99 2.5s）。
 //
 // 现在的做法：请求协程只把 Entry 丢进有界队列（非阻塞），后台协程攒批，
 // 在**单个事务**里批量插入日志 + 合并写 last_used_at（last-write-wins，天生可合并），
-// 于是每批只有一次 fsync。实测批量插入 0.093ms/条，比逐条快 17 倍。
+// 于是「每请求 3 个事务」变成「每批 1 个事务」。
+//
+// 换到 PostgreSQL 后攒批依然是净收益，只是收益来源变了：
+// 不再是「绕开单写者」，而是更少的事务提交、更少的 WAL flush、更少的网络往返。
 //
 // Sink 是接口：将来要多实例部署、或要把日志交给独立消费者写 ClickHouse，
 // 换一个 Redis Stream 实现即可，请求侧代码不用动。
@@ -151,6 +154,13 @@ func (b *Batch) loop() {
 	}
 }
 
+// insertChunk 单条 INSERT 里放多少行。
+//
+// PostgreSQL 的协议限制：一条语句最多 65535 个绑定参数。RequestLog 有 ~30 列，
+// 所以每条 INSERT 的行数必须 < 65535/30 ≈ 2184。这跟用户可调的「攒批条数」
+// 是两件事——攒批决定事务多大，这里决定事务内切成几条语句，取 500 留足余量。
+const insertChunk = 500
+
 // persist 一批数据：先写归档文件，再在单事务里批量插入日志 + 合并 UPDATE。
 //
 // 顺序很重要：文件先落盘、日志行后入库，保证「日志里能看到的请求，原文一定已存在」。
@@ -184,8 +194,15 @@ func (b *Batch) persist(batch []Entry) {
 
 	now := time.Now()
 	err := b.db.Transaction(func(tx *gorm.DB) error {
+		// 只对这个事务关掉同步提交：日志是观测数据，丢最近几个事务可以接受，
+		// 换来不必等 WAL 落盘确认。SET LOCAL 随事务结束自动失效，
+		// 所以配置/用户这些写入仍然是默认的 synchronous_commit=on。
+		// （sqlite 的 synchronous=NORMAL 是全库开关，做不到这种区分）
+		if err := tx.Exec("SET LOCAL synchronous_commit = off").Error; err != nil {
+			return err
+		}
 		if len(logs) > 0 {
-			if err := tx.CreateInBatches(logs, 200).Error; err != nil {
+			if err := tx.CreateInBatches(logs, insertChunk).Error; err != nil {
 				return err
 			}
 		}
