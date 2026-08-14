@@ -53,7 +53,7 @@ func (p *OpenAIProtocol) BuildRequest(ctx context.Context, ch *store.Channel, re
 		return nil, err
 	}
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+ch.APIKey)
+	r.Header.Set("Authorization", "Bearer "+req.APIKey)
 	if req.Stream {
 		r.Header.Set("Accept", "text/event-stream")
 	}

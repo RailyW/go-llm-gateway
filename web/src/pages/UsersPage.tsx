@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { KeyRound, Trash2 } from 'lucide-react'
-import { api, type User } from '@/lib/api'
+import { api, type Group, type User } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
 import { Button } from '@/components/ui/button'
 import { Badge, Select, Switch } from '@/components/ui/misc'
@@ -11,10 +11,12 @@ import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableR
 export default function UsersPage() {
   const { user: me } = useAuth()
   const [list, setList] = useState<User[]>([])
+  const [groups, setGroups] = useState<Group[]>([])
 
   const load = () => api.users().then(setList).catch((e) => toast.error((e as Error).message))
   useEffect(() => {
     load()
+    api.groups().then(setGroups).catch(() => {})
   }, [])
 
   const update = async (u: User, v: Parameters<typeof api.updateUser>[1]) => {
@@ -48,7 +50,9 @@ export default function UsersPage() {
     <div className="space-y-4">
       <div>
         <h1 className="text-xl font-semibold">用户</h1>
-        <p className="text-sm text-muted-foreground">角色、启停与密码重置</p>
+        <p className="text-sm text-muted-foreground">
+          角色、归属、启停与密码重置。归属决定该用户能用哪些上游 key（归属枚举在设置页维护）。
+        </p>
       </div>
 
       <Card>
@@ -59,13 +63,14 @@ export default function UsersPage() {
                 <TableHead>ID</TableHead>
                 <TableHead>用户名</TableHead>
                 <TableHead>角色</TableHead>
+                <TableHead>归属</TableHead>
                 <TableHead>启用</TableHead>
                 <TableHead>注册时间</TableHead>
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {list.length === 0 && <TableEmpty colSpan={6} />}
+              {list.length === 0 && <TableEmpty colSpan={7} />}
               {list.map((u) => (
                 <TableRow key={u.id}>
                   <TableCell className="text-muted-foreground">{u.id}</TableCell>
@@ -77,6 +82,16 @@ export default function UsersPage() {
                     <Select className="w-28" value={u.role} onChange={(e) => update(u, { role: e.target.value })}>
                       <option value="admin">admin</option>
                       <option value="user">user</option>
+                    </Select>
+                  </TableCell>
+                  <TableCell>
+                    <Select className="w-40" value={u.group_id} onChange={(e) => update(u, { group_id: Number(e.target.value) })}>
+                      {groups.map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.name}
+                        </option>
+                      ))}
+                      {!groups.some((g) => g.id === u.group_id) && <option value={u.group_id}>#{u.group_id}</option>}
                     </Select>
                   </TableCell>
                   <TableCell>

@@ -2,7 +2,22 @@
 
 一个**最小可用**的 LLM 网关转发服务（对标 new-api 的极简版），Go + React。
 
-只做核心闭环：**上游录入 → 模型录入 → 模型/上游绑定 → 发放自己的 API Key → 按端点同协议转发**。
+只做核心闭环：**上游录入 → 模型录入 → 模型/上游绑定 → 归属化的上游 key → 发放自己的 API Key → 按端点同协议转发**。
+
+## 上游 key 的选取链路
+
+```
+客户端请求 (model=网关模型名, 打某个端点)
+  └─ 模型 ─► 绑定 (上游渠道 + 上游模型名)        # 只保留支持该端点协议的上游
+       └─ 调用者所属「归属」(部门)
+            └─ 该上游 × 该归属 下的可用 key 集合   # 一个渠道一个归属可以配多把
+                 └─ key 选择策略 (random / weighted / affinity-hash)
+```
+
+- **归属 (Group)** 类似部门，在设置页维护枚举；每个用户属于一个归属（admin 在用户页可改）
+- 上游 key 表是 `渠道 × 归属 × N 把 key`：不同归属用不同 key，天然做到**用户只能用自己归属下的 key**
+- 某上游在调用者归属下**没有可用 key** 时，这条绑定不参与路由；全都没有则明确报错
+- key 选择策略可插拔（`internal/relay/keyselector`），已内置 `affinity-hash`：同一网关 key 固定粘同一把上游 key（上游 prompt cache 友好）
 
 ## 转发模型：同协议直转，不做协议翻译
 
@@ -21,14 +36,16 @@
 
 | 模块 | 说明 |
 | --- | --- |
-| 用户 | 注册 / 登录（JWT），角色 `admin` / `user`，首次启动自带 `admin / admin` |
-| 上游 (Channel) | `base_url` + `api_key` + **支持的协议端点多选**（openai-chat / openai-responses / anthropic-messages） |
+| 用户 | 注册 / 登录（JWT），角色 `admin` / `user`，归属（部门），首次启动自带 `admin / admin` |
+| 归属 (Group) | 部门枚举，设置页维护；决定用户能用哪些上游 key；有用户/key 挂着或是默认归属时不可删 |
+| 上游 (Channel) | `base_url` + **支持的协议端点多选**（openai-chat / openai-responses / anthropic-messages） |
+| 上游 Key (ChannelKey) | 归属于「某上游 + 某归属」，同一组合可多把；带权重、启停、最近使用时间 |
 | 模型 (Model) | 对外暴露的模型名（客户端请求里的 `model`） |
 | 绑定 (Binding) | 模型 → 上游 + **上游真实模型名**，支持一个模型绑多个上游 |
-| 路由策略 | `random`（默认）/ `weighted`，可在设置页切换，接口可扩展 |
+| 路由策略 | 选上游绑定：`random`（默认）/ `weighted`；选上游 key：`random`（默认）/ `weighted` / `affinity-hash`。都可在设置页切换、都可扩展 |
 | API Key | 网关自己发放的 `sk-...`，归属用户，可停用/删除 |
 | 网关端点 | `/v1/chat/completions`、`/v1/responses`、`/v1/messages`（都含 **SSE 流式**）、`GET /v1/models` |
-| 日志 | `logs` 表：用户、模型、上游、tokens、耗时、状态码、错误 |
+| 日志 | `logs` 表：用户+归属、端点/协议、模型、上游+实际用的上游 key、tokens、耗时、状态码、错误 |
 | 原文归档 | 每次请求的**请求原文 + 响应全文**落本地文件，文件名 = 日志的 request id |
 | 清理服务 | 后台 goroutine 按保留天数（默认 7 天，WebUI 可改）删除归档与历史日志 |
 
@@ -50,7 +67,8 @@ make dev-web       # 终端 2: 前端 :5173（已配置 /api、/v1 代理到 808
 make mock          # 终端 3(可选): mock 上游 :9911，无需真实 key 即可联调
 ```
 
-联调步骤：`上游` 页新增 → `模型` 页新增 → 展开模型点「绑定」→ `API Key` 页新建 key → 调用：
+联调步骤：`设置` 页建归属 → `上游` 页新增渠道、展开后按归属「加 Key」→ `模型` 页新增、展开点「绑定」→
+`用户` 页确认自己的归属 → `API Key` 页新建 key → 调用：
 
 ```bash
 # OpenAI chat/completions
@@ -84,9 +102,10 @@ backend/
     protocol.go                   ★ 端点协议接口 + 注册表 + 共用小工具
     protocol_openai.go            openai-chat / openai-responses（Bearer）
     protocol_anthropic.go         anthropic-messages（x-api-key + anthropic-version）
-    relay.go                      转发主流程（协议无关：选上游 → 改模型名 → 直转 → 流式/非流式 → 落日志）
+    relay.go                      转发主流程（协议无关：选上游 → 按归属选 key → 改模型名 → 直转 → 落日志）
+    selector/selector.go          ★ 上游绑定选择策略（random / weighted）
+    keyselector/keyselector.go    ★ 上游 key 选择策略（random / weighted / affinity-hash）
     archive.go                    请求/响应原文归档与按天清理
-    selector/selector.go          ★ 路由策略接口 + random / weighted
   internal/cleaner/               后台清理服务
   internal/httpapi/               gin 路由、中间件、各资源 handler、静态前端挂载
   internal/web/                   //go:embed dist（前端产物）
@@ -114,7 +133,10 @@ scripts/mock_upstream.py          本地 mock 上游
 | `GATEWAY_ADMIN_USER/PASS` | `admin` / `admin` | 初始管理员（仅无 admin 时创建） |
 | `GATEWAY_ALLOW_REGISTER` | `true` | 是否允许自助注册（也可在设置页改） |
 
-WebUI 可改的运行时配置：归档保留天数、日志保留天数、清理间隔、路由策略、上游超时、注册开关。
+WebUI 可改的运行时配置：归档保留天数、日志保留天数、清理间隔、上游绑定路由策略、**上游 key 选择策略**、
+**新用户默认归属**、上游超时、注册开关。
+
+老库升级说明：启动时若发现旧的 `channels.api_key` 列，会自动把它迁成 `default` 归属下的一把 `ChannelKey` 并删除该列。
 
 ## 扩展点
 
@@ -140,10 +162,14 @@ type Protocol interface {
 
 三个已实现协议的差异就只有：**路径、鉴权头、usage 字段、错误体格式**——body 不碰。
 
-**加一个路由策略**（如轮询、最少失败）：在 `internal/relay/selector/` 实现 `Selector` 并 `Register`，设置页的下拉框会自动出现。
+**加一个上游选择策略**（如轮询、最少失败）：在 `internal/relay/selector/` 实现 `Selector` 并 `Register`。
+
+**加一个上游 key 选择策略**（如按会话亲和、按剩余额度）：在 `internal/relay/keyselector/` 实现 `Selector` 并 `Register`。
+`Context` 里已经带了 channel/group/user/网关key/模型/协议/`AffinityKey`，够做亲和性。
+两者的下拉框都会在设置页自动出现。
 
 ## API 一览
 
 - 网关：`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`、`GET /v1/models`（用网关发放的 `sk-...`）
 - 管理（Bearer JWT）：`/api/auth/*`、`/api/keys`、`/api/logs`、`/api/stats`
-- 管理员：`/api/channels`、`/api/models`、`/api/models/:id/bindings`、`/api/bindings/:id`、`/api/settings`、`/api/users`
+- 管理员：`/api/channels`、`/api/channels/:id/keys`、`/api/channel-keys/:id`、`/api/groups`、`/api/models`、`/api/models/:id/bindings`、`/api/bindings/:id`、`/api/settings`、`/api/users`

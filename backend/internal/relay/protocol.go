@@ -35,6 +35,7 @@ type Usage struct {
 // ProtoRequest 一次转发的请求上下文。Body 已把 model 换成上游模型名，其余原样。
 type ProtoRequest struct {
 	UpstreamModel string
+	APIKey        string // 本次选中的**上游 key**（按归属挑出来的）
 	Stream        bool
 	Body          []byte
 	ClientHeader  http.Header

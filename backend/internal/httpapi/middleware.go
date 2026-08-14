@@ -29,7 +29,7 @@ func (s *Server) JWTAuth() gin.HandlerFunc {
 			return
 		}
 		var u store.User
-		if err := s.db.First(&u, claims.UserID).Error; err != nil {
+		if err := s.db.Preload("Group").First(&u, claims.UserID).Error; err != nil {
 			fail(c, http.StatusUnauthorized, "用户不存在")
 			return
 		}
@@ -74,17 +74,26 @@ func (s *Server) GatewayAuth() gin.HandlerFunc {
 			return
 		}
 		var u store.User
-		if err := s.db.First(&u, k.UserID).Error; err != nil || !u.Enabled {
+		if err := s.db.Preload("Group").First(&u, k.UserID).Error; err != nil || !u.Enabled {
 			openaiError(c, http.StatusForbidden, "所属用户不可用")
 			return
 		}
-		c.Set(ctxActor, relay.Actor{
+		if u.Group != nil && !u.Group.Enabled {
+			openaiError(c, http.StatusForbidden, "所属归属("+u.Group.Name+")已被禁用")
+			return
+		}
+		actor := relay.Actor{
 			UserID:     u.ID,
 			Username:   u.Username,
+			GroupID:    u.GroupID,
 			APIKeyID:   k.ID,
 			APIKeyName: k.Name,
 			ClientIP:   c.ClientIP(),
-		})
+		}
+		if u.Group != nil {
+			actor.GroupName = u.Group.Name
+		}
+		c.Set(ctxActor, actor)
 		c.Next()
 	}
 }

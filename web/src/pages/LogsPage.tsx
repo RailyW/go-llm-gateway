@@ -97,7 +97,7 @@ export default function LogsPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>时间</TableHead>
-                <TableHead>用户</TableHead>
+                <TableHead>用户 / 归属</TableHead>
                 <TableHead>端点</TableHead>
                 <TableHead>模型</TableHead>
                 <TableHead>上游</TableHead>
@@ -114,7 +114,14 @@ export default function LogsPage() {
                   <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                     {new Date(l.created_at).toLocaleString()}
                   </TableCell>
-                  <TableCell>{l.username}</TableCell>
+                  <TableCell className="whitespace-nowrap">
+                    {l.username}
+                    {l.group_name && (
+                      <Badge variant="secondary" className="ml-1">
+                        {l.group_name}
+                      </Badge>
+                    )}
+                  </TableCell>
                   <TableCell className="whitespace-nowrap font-mono text-xs" title={l.protocol}>
                     {l.endpoint || '—'}
                   </TableCell>
@@ -126,6 +133,7 @@ export default function LogsPage() {
                     {l.channel_name ? (
                       <>
                         {l.channel_name} <span className="text-muted-foreground">/ {l.upstream_model}</span>
+                        {l.channel_key_name && <div className="text-muted-foreground">key: {l.channel_key_name}</div>}
                       </>
                     ) : (
                       '—'

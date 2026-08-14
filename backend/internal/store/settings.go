@@ -16,6 +16,8 @@ const (
 	KeyLogRetentionDays      = "log_retention_days"       // logs 表保留天数，0 = 永久
 	KeyCleanupIntervalMin    = "cleanup_interval_minutes" // 清理服务运行间隔
 	KeyRouteStrategy         = "route_strategy"           // 多绑定路由策略
+	KeyUpstreamKeyStrategy   = "upstream_key_strategy"    // 归属下多把上游 key 的选择策略
+	KeyDefaultGroupID        = "default_group_id"         // 新注册用户的默认归属
 	KeyAllowRegister         = "allow_register"           // 是否允许注册
 	KeyUpstreamTimeoutSecond = "upstream_timeout_seconds" // 上游超时（流式不受限）
 )
@@ -25,6 +27,8 @@ var defaults = map[string]string{
 	KeyLogRetentionDays:      "30",
 	KeyCleanupIntervalMin:    "60",
 	KeyRouteStrategy:         "random",
+	KeyUpstreamKeyStrategy:   "random",
+	KeyDefaultGroupID:        "1",
 	KeyAllowRegister:         "true",
 	KeyUpstreamTimeoutSecond: "300",
 }
@@ -92,6 +96,13 @@ func GetSetting(key string) string {
 func GetSettingInt(key string, def int) int {
 	if n, err := strconv.Atoi(GetSetting(key)); err == nil {
 		return n
+	}
+	return def
+}
+
+func GetSettingUint(key string, def uint) uint {
+	if n, err := strconv.Atoi(GetSetting(key)); err == nil && n > 0 {
+		return uint(n)
 	}
 	return def
 }

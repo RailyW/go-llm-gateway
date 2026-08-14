@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rin/go-llm-gateway/backend/internal/relay/keyselector"
 	"github.com/rin/go-llm-gateway/backend/internal/relay/selector"
 	"github.com/rin/go-llm-gateway/backend/internal/store"
 	"gorm.io/gorm"
@@ -27,6 +28,8 @@ const (
 type Actor struct {
 	UserID     uint
 	Username   string
+	GroupID    uint // 归属：决定能用哪些上游 key
+	GroupName  string
 	APIKeyID   uint
 	APIKeyName string
 	ClientIP   string
@@ -65,6 +68,8 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 		Endpoint:    p.InboundPath(),
 		UserID:      actor.UserID,
 		Username:    actor.Username,
+		GroupID:     actor.GroupID,
+		GroupName:   actor.GroupName,
 		APIKeyID:    actor.APIKeyID,
 		APIKeyName:  actor.APIKeyName,
 		ClientIP:    actor.ClientIP,
@@ -91,7 +96,7 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 		return
 	}
 
-	binding, err := s.pick(model, p.Name())
+	binding, upKey, err := s.pick(model, p.Name(), actor)
 	if err != nil {
 		s.archiveRequest(dateDir, reqID, rec, body, "", stream, r.Header)
 		s.fail(w, p, rec, http.StatusNotFound, err.Error())
@@ -100,6 +105,8 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 	rec.ChannelID = binding.ChannelID
 	rec.ChannelName = binding.Channel.Name
 	rec.UpstreamModel = binding.UpstreamModel
+	rec.ChannelKeyID = upKey.ID
+	rec.ChannelKeyName = upKey.Name
 
 	upBody, err := p.ReplaceModel(body, binding.UpstreamModel)
 	if err != nil {
@@ -118,6 +125,7 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 
 	upReq, err := p.BuildRequest(ctx, binding.Channel, &ProtoRequest{
 		UpstreamModel: binding.UpstreamModel,
+		APIKey:        upKey.Key,
 		Stream:        stream,
 		Body:          upBody,
 		ClientHeader:  r.Header,
@@ -217,17 +225,26 @@ func (s *Service) pipeStream(w http.ResponseWriter, resp *http.Response, p Proto
 	s.finish(rec, dateDir, resp.StatusCode, archive.Bytes())
 }
 
-// pick 找模型 -> 只保留**支持该协议**的上游绑定 -> 按策略选一个。
-func (s *Service) pick(modelName, protocol string) (*store.Binding, error) {
+// pick 路由核心：
+//
+//	网关模型名 -> 绑定(上游 + 上游模型名)，且该上游支持本次协议
+//	          -> 调用方归属下、该上游的可用 key
+//	          -> 按 key 策略选一把
+//
+// 上游若在该归属下没有可用 key，则这条绑定不参与路由。
+func (s *Service) pick(modelName, protocol string, actor Actor) (*store.Binding, *store.ChannelKey, error) {
 	var m store.Model
 	if err := s.db.Where("name = ?", modelName).First(&m).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("模型 %s 不存在", modelName)
+			return nil, nil, fmt.Errorf("模型 %s 不存在", modelName)
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	if !m.Enabled {
-		return nil, fmt.Errorf("模型 %s 已禁用", modelName)
+		return nil, nil, fmt.Errorf("模型 %s 已禁用", modelName)
+	}
+	if actor.GroupID == 0 {
+		return nil, nil, fmt.Errorf("用户 %s 未设置归属，请联系管理员", actor.Username)
 	}
 
 	var bindings []store.Binding
@@ -235,23 +252,65 @@ func (s *Service) pick(modelName, protocol string) (*store.Binding, error) {
 		Joins("JOIN channels ON channels.id = bindings.channel_id").
 		Where("bindings.model_id = ? AND bindings.enabled = 1 AND channels.enabled = 1", m.ID).
 		Where("channels.protocols LIKE ?", "%,"+protocol+",%").
+		// 该上游必须在调用方归属下有可用 key
+		Where(`EXISTS (SELECT 1 FROM channel_keys ck
+		               WHERE ck.channel_id = channels.id AND ck.group_id = ? AND ck.enabled = 1)`, actor.GroupID).
 		Find(&bindings).Error
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(bindings) == 0 {
-		return nil, fmt.Errorf("模型 %s 没有支持 %s 协议的可用上游绑定", modelName, protocol)
+		return nil, nil, fmt.Errorf("模型 %s 在归属 %s 下没有可用上游（需要上游支持 %s 协议且该归属下已配置 key）",
+			modelName, actor.GroupLabel(), protocol)
 	}
 
-	sel := selector.Get(store.GetSetting(store.KeyRouteStrategy))
-	b, err := sel.Select(bindings)
+	b, err := selector.Get(store.GetSetting(store.KeyRouteStrategy)).Select(bindings)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if b.Channel == nil {
-		return nil, fmt.Errorf("绑定 %d 的上游不存在", b.ID)
+		return nil, nil, fmt.Errorf("绑定 %d 的上游不存在", b.ID)
 	}
-	return b, nil
+
+	var keys []store.ChannelKey
+	if err := s.db.Where("channel_id = ? AND group_id = ? AND enabled = 1", b.ChannelID, actor.GroupID).
+		Order("id asc").Find(&keys).Error; err != nil {
+		return nil, nil, err
+	}
+	if len(keys) == 0 {
+		return nil, nil, fmt.Errorf("上游 %s 在归属 %s 下没有可用 key", b.Channel.Name, actor.GroupLabel())
+	}
+
+	k, err := keyselector.Get(store.GetSetting(store.KeyUpstreamKeyStrategy)).Select(keyselector.Context{
+		ChannelID:     b.ChannelID,
+		GroupID:       actor.GroupID,
+		UserID:        actor.UserID,
+		GatewayKeyID:  actor.APIKeyID,
+		Model:         modelName,
+		UpstreamModel: b.UpstreamModel,
+		Protocol:      protocol,
+		AffinityKey:   actor.AffinityKey(),
+	}, keys)
+	if err != nil {
+		return nil, nil, err
+	}
+	return b, k, nil
+}
+
+// GroupLabel 归属展示名。
+func (a Actor) GroupLabel() string {
+	if a.GroupName != "" {
+		return a.GroupName
+	}
+	return fmt.Sprintf("#%d", a.GroupID)
+}
+
+// AffinityKey 亲和性维度：默认按「网关 key」粘住同一把上游 key。
+func (a Actor) AffinityKey() string {
+	if a.APIKeyID > 0 {
+		return fmt.Sprintf("gwkey:%d", a.APIKeyID)
+	}
+	return fmt.Sprintf("user:%d", a.UserID)
 }
 
 func (s *Service) archiveRequest(dateDir, reqID string, rec *store.RequestLog, body []byte, upURL string, stream bool, header http.Header) {
@@ -263,9 +322,11 @@ func (s *Service) archiveRequest(dateDir, reqID string, rec *store.RequestLog, b
 		Username:       rec.Username,
 		APIKeyName:     rec.APIKeyName,
 		ClientIP:       rec.ClientIP,
+		GroupName:      rec.GroupName,
 		RequestedModel: rec.ModelName,
 		ChannelName:    rec.ChannelName,
 		UpstreamModel:  rec.UpstreamModel,
+		ChannelKeyName: rec.ChannelKeyName,
 		UpstreamURL:    upURL,
 		Stream:         stream,
 		Body:           body,
@@ -291,9 +352,12 @@ func (s *Service) finish(rec *store.RequestLog, dateDir string, status int, resp
 	if err := s.db.Create(rec).Error; err != nil {
 		log.Printf("[log] 写日志失败 %s: %v", rec.ID, err)
 	}
+	now := time.Now()
 	if rec.APIKeyID > 0 {
-		now := time.Now()
 		s.db.Model(&store.APIKey{}).Where("id = ?", rec.APIKeyID).Update("last_used_at", now)
+	}
+	if rec.ChannelKeyID > 0 {
+		s.db.Model(&store.ChannelKey{}).Where("id = ?", rec.ChannelKeyID).Update("last_used_at", now)
 	}
 }
 

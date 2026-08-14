@@ -70,6 +70,16 @@ func (s *Server) Router() *gin.Engine {
 		admin.PUT("/channels/:id", s.updateChannel)
 		admin.DELETE("/channels/:id", s.deleteChannel)
 
+		admin.GET("/channels/:id/keys", s.listChannelKeys)
+		admin.POST("/channels/:id/keys", s.createChannelKey)
+		admin.PUT("/channel-keys/:id", s.updateChannelKey)
+		admin.DELETE("/channel-keys/:id", s.deleteChannelKey)
+
+		admin.GET("/groups", s.listGroups)
+		admin.POST("/groups", s.createGroup)
+		admin.PUT("/groups/:id", s.updateGroup)
+		admin.DELETE("/groups/:id", s.deleteGroup)
+
 		admin.GET("/models", s.listModels)
 		admin.POST("/models", s.createModel)
 		admin.PUT("/models/:id", s.updateModel)

@@ -4,11 +4,34 @@ export const getToken = () => localStorage.getItem(TOKEN_KEY)
 export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t)
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
 
+export interface Group {
+  id: number
+  name: string
+  remark: string
+  enabled: boolean
+  created_at: string
+  user_count?: number
+  key_count?: number
+}
 export interface User {
   id: number
   username: string
   role: 'admin' | 'user'
+  group_id: number
+  group?: Group
   enabled: boolean
+  created_at: string
+}
+export interface ChannelKey {
+  id: number
+  channel_id: number
+  group_id: number
+  group?: Group
+  name: string
+  key_masked: string
+  weight: number
+  enabled: boolean
+  last_used_at: string | null
   created_at: string
 }
 export interface ProtocolInfo {
@@ -23,9 +46,9 @@ export interface Channel {
   name: string
   protocols: string[]
   base_url: string
-  api_key: string
   enabled: boolean
   created_at: string
+  keys?: ChannelKey[]
 }
 export interface Binding {
   id: number
@@ -56,6 +79,8 @@ export interface LogItem {
   id: string
   protocol: string
   endpoint: string
+  group_name: string
+  channel_key_name: string
   username: string
   api_key_name: string
   model_name: string
@@ -123,6 +148,18 @@ export const api = {
   stats: () => request<Record<string, number | CleanerStatus>>('/stats'),
 
   channels: () => request<Channel[]>('/channels'),
+  channelKeys: (channelId: number) => request<ChannelKey[]>(`/channels/${channelId}/keys`),
+  createChannelKey: (channelId: number, v: { group_id: number; name?: string; key: string; weight?: number }) =>
+    request<ChannelKey>(`/channels/${channelId}/keys`, { method: 'POST', body: body(v) }),
+  updateChannelKey: (id: number, v: Partial<{ group_id: number; name: string; key: string; weight: number; enabled: boolean }>) =>
+    request<ChannelKey>(`/channel-keys/${id}`, { method: 'PUT', body: body(v) }),
+  deleteChannelKey: (id: number) => request<void>(`/channel-keys/${id}`, { method: 'DELETE' }),
+
+  groups: () => request<Group[]>('/groups'),
+  createGroup: (v: { name: string; remark?: string }) => request<Group>('/groups', { method: 'POST', body: body(v) }),
+  updateGroup: (id: number, v: Partial<{ name: string; remark: string; enabled: boolean }>) =>
+    request<Group>(`/groups/${id}`, { method: 'PUT', body: body(v) }),
+  deleteGroup: (id: number) => request<void>(`/groups/${id}`, { method: 'DELETE' }),
   createChannel: (v: Partial<Channel>) => request<Channel>('/channels', { method: 'POST', body: body(v) }),
   updateChannel: (id: number, v: Partial<Channel>) => request<Channel>(`/channels/${id}`, { method: 'PUT', body: body(v) }),
   deleteChannel: (id: number) => request<void>(`/channels/${id}`, { method: 'DELETE' }),
@@ -153,6 +190,7 @@ export const api = {
     request<{
       settings: Record<string, string>
       strategies: string[]
+      key_strategies: string[]
       protocols: ProtocolInfo[]
       cleaner: CleanerStatus
     }>('/settings'),
@@ -161,7 +199,7 @@ export const api = {
   runCleanup: () => request<{ ok: boolean; cleaner: CleanerStatus }>('/settings/cleanup', { method: 'POST' }),
 
   users: () => request<User[]>('/users'),
-  updateUser: (id: number, v: { role?: string; enabled?: boolean; password?: string }) =>
+  updateUser: (id: number, v: { role?: string; group_id?: number; enabled?: boolean; password?: string }) =>
     request<User>(`/users/${id}`, { method: 'PUT', body: body(v) }),
   deleteUser: (id: number) => request<void>(`/users/${id}`, { method: 'DELETE' }),
 }

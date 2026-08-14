@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/rin/go-llm-gateway/backend/internal/relay/keyselector"
 	"github.com/rin/go-llm-gateway/backend/internal/relay/selector"
 	"github.com/rin/go-llm-gateway/backend/internal/store"
 )
@@ -69,8 +70,14 @@ func TestReplaceModelKeepsBody(t *testing.T) {
 
 // 上游鉴权头：openai 用 Bearer，anthropic 用 x-api-key + anthropic-version
 func TestBuildRequestAuth(t *testing.T) {
-	ch := &store.Channel{BaseURL: "http://up.local", APIKey: "up-key"}
-	req := &ProtoRequest{UpstreamModel: "m", Stream: true, Body: []byte(`{}`), ClientHeader: httptest.NewRequest("POST", "/", nil).Header}
+	ch := &store.Channel{BaseURL: "http://up.local"}
+	req := &ProtoRequest{
+		UpstreamModel: "m",
+		APIKey:        "up-key", // 由归属挑出来的上游 key
+		Stream:        true,
+		Body:          []byte(`{}`),
+		ClientHeader:  httptest.NewRequest("POST", "/", nil).Header,
+	}
 
 	chat, _ := GetProtocol(ProtocolOpenAIChat)
 	r, err := chat.BuildRequest(t.Context(), ch, req)
@@ -186,6 +193,36 @@ func TestSSEPayload(t *testing.T) {
 	}
 	if _, ok := ssePayload([]byte("event: message_start")); ok {
 		t.Error("非 data 行不应被当作载荷")
+	}
+}
+
+// 上游 key 选择：随机/加权都要选出来；亲和性策略要稳定
+func TestKeySelectors(t *testing.T) {
+	keys := []store.ChannelKey{{ID: 7, Weight: 1}, {ID: 3, Weight: 4}, {ID: 11, Weight: 1}}
+	ctx := keyselector.Context{ChannelID: 1, GroupID: 2, UserID: 3, GatewayKeyID: 9, AffinityKey: "gwkey:9"}
+
+	for _, name := range []string{"random", "weighted", "affinity-hash", "unknown-fallback"} {
+		k, err := keyselector.Get(name).Select(ctx, keys)
+		if err != nil || k == nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if _, err := keyselector.Get("random").Select(ctx, nil); err == nil {
+		t.Error("空 key 列表应报错")
+	}
+
+	// 亲和性：同一 AffinityKey 多次选择必须落在同一把 key 上
+	aff := keyselector.Get("affinity-hash")
+	first, _ := aff.Select(ctx, keys)
+	for i := 0; i < 20; i++ {
+		got, _ := aff.Select(ctx, keys)
+		if got.ID != first.ID {
+			t.Fatalf("亲和性不稳定: %d vs %d", got.ID, first.ID)
+		}
+	}
+	// AffinityKey 为空时退化为随机（不报错即可）
+	if _, err := aff.Select(keyselector.Context{}, keys); err != nil {
+		t.Error(err)
 	}
 }
 

@@ -55,7 +55,13 @@ func (s *Server) register(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	u := store.User{Username: in.Username, PasswordHash: hash, Role: store.RoleUser, Enabled: true}
+	u := store.User{
+		Username:     in.Username,
+		PasswordHash: hash,
+		Role:         store.RoleUser,
+		GroupID:      store.GetSettingUint(store.KeyDefaultGroupID, 1), // 新用户落到默认归属
+		Enabled:      true,
+	}
 	if err := s.db.Create(&u).Error; err != nil {
 		fail(c, http.StatusInternalServerError, err.Error())
 		return
@@ -128,7 +134,7 @@ func (s *Server) changePassword(c *gin.Context) {
 
 func (s *Server) listUsers(c *gin.Context) {
 	var list []store.User
-	if err := s.db.Order("id asc").Find(&list).Error; err != nil {
+	if err := s.db.Preload("Group").Order("id asc").Find(&list).Error; err != nil {
 		fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -143,6 +149,7 @@ func (s *Server) updateUser(c *gin.Context) {
 	}
 	var in struct {
 		Role     *string `json:"role"`
+		GroupID  *uint   `json:"group_id"`
 		Enabled  *bool   `json:"enabled"`
 		Password *string `json:"password"`
 	}
@@ -153,6 +160,13 @@ func (s *Server) updateUser(c *gin.Context) {
 	updates := map[string]any{}
 	if in.Role != nil && (*in.Role == store.RoleAdmin || *in.Role == store.RoleUser) {
 		updates["role"] = *in.Role
+	}
+	if in.GroupID != nil && *in.GroupID > 0 {
+		if err := s.db.First(&store.Group{}, *in.GroupID).Error; err != nil {
+			fail(c, http.StatusBadRequest, "归属不存在")
+			return
+		}
+		updates["group_id"] = *in.GroupID
 	}
 	if in.Enabled != nil {
 		updates["enabled"] = *in.Enabled
@@ -174,6 +188,7 @@ func (s *Server) updateUser(c *gin.Context) {
 			return
 		}
 	}
+	s.db.Preload("Group").First(&u, u.ID)
 	c.JSON(http.StatusOK, u)
 }
 

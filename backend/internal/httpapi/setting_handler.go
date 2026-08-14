@@ -6,16 +6,18 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rin/go-llm-gateway/backend/internal/relay"
+	"github.com/rin/go-llm-gateway/backend/internal/relay/keyselector"
 	"github.com/rin/go-llm-gateway/backend/internal/relay/selector"
 	"github.com/rin/go-llm-gateway/backend/internal/store"
 )
 
 func (s *Server) getSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"settings":   store.AllSettings(),
-		"strategies": selector.Names(),
-		"protocols":  relay.ProtocolInfos(),
-		"cleaner":    s.cleaner.Status(),
+		"settings":       store.AllSettings(),
+		"strategies":     selector.Names(),
+		"key_strategies": keyselector.Names(),
+		"protocols":      relay.ProtocolInfos(),
+		"cleaner":        s.cleaner.Status(),
 	})
 }
 
@@ -26,7 +28,7 @@ func (s *Server) updateSettings(c *gin.Context) {
 		return
 	}
 	// 数字类配置做个基本校验
-	for _, k := range []string{store.KeyArchiveRetentionDays, store.KeyLogRetentionDays, store.KeyCleanupIntervalMin, store.KeyUpstreamTimeoutSecond} {
+	for _, k := range []string{store.KeyArchiveRetentionDays, store.KeyLogRetentionDays, store.KeyCleanupIntervalMin, store.KeyUpstreamTimeoutSecond, store.KeyDefaultGroupID} {
 		if v, ok := in[k]; ok {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 0 {
@@ -39,15 +41,28 @@ func (s *Server) updateSettings(c *gin.Context) {
 			}
 		}
 	}
-	if v, ok := in[store.KeyRouteStrategy]; ok {
+	for key, names := range map[string][]string{
+		store.KeyRouteStrategy:       selector.Names(),
+		store.KeyUpstreamKeyStrategy: keyselector.Names(),
+	} {
+		v, ok := in[key]
+		if !ok {
+			continue
+		}
 		valid := false
-		for _, n := range selector.Names() {
+		for _, n := range names {
 			if n == v {
 				valid = true
 			}
 		}
 		if !valid {
-			fail(c, http.StatusBadRequest, "未知路由策略: "+v)
+			fail(c, http.StatusBadRequest, "未知策略: "+v)
+			return
+		}
+	}
+	if v, ok := in[store.KeyDefaultGroupID]; ok {
+		if err := s.db.First(&store.Group{}, v).Error; err != nil {
+			fail(c, http.StatusBadRequest, "默认归属不存在")
 			return
 		}
 	}

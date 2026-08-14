@@ -19,14 +19,6 @@ func (s *Server) listModels(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 抹掉绑定里带出来的上游 api_key
-	for i := range list {
-		for j := range list[i].Bindings {
-			if ch := list[i].Bindings[j].Channel; ch != nil {
-				ch.APIKey = maskKey(ch.APIKey)
-			}
-		}
-	}
 	c.JSON(http.StatusOK, list)
 }
 
@@ -146,8 +138,8 @@ func (s *Server) createBinding(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
+	ch.ProtocolList = store.SplitProtocols(ch.Protocols)
 	b.Channel = &ch
-	b.Channel.APIKey = maskKey(ch.APIKey)
 	c.JSON(http.StatusOK, b)
 }
 

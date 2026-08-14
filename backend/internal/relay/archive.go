@@ -31,11 +31,13 @@ type RequestMeta struct {
 	Protocol       string            `json:"protocol"`
 	Endpoint       string            `json:"endpoint"`
 	Username       string            `json:"username"`
+	GroupName      string            `json:"group_name"`
 	APIKeyName     string            `json:"api_key_name"`
 	ClientIP       string            `json:"client_ip"`
 	RequestedModel string            `json:"requested_model"`
 	ChannelName    string            `json:"channel_name"`
 	UpstreamModel  string            `json:"upstream_model"`
+	ChannelKeyName string            `json:"channel_key_name"`
 	UpstreamURL    string            `json:"upstream_url"`
 	Stream         bool              `json:"stream"`
 	ClientHeaders  map[string]string `json:"client_headers,omitempty"`

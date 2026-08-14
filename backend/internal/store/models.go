@@ -13,9 +13,22 @@ type User struct {
 	Username     string    `gorm:"uniqueIndex;size:64;not null" json:"username"`
 	PasswordHash string    `gorm:"not null" json:"-"`
 	Role         string    `gorm:"size:16;not null;default:user" json:"role"`
+	GroupID      uint      `gorm:"index;not null;default:1" json:"group_id"` // 归属（部门）
 	Enabled      bool      `gorm:"not null;default:true" json:"enabled"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+
+	Group *Group `gorm:"foreignKey:GroupID" json:"group,omitempty"`
+}
+
+// Group 用户归属（类似部门）。用户只能用自己归属下的上游 key。
+type Group struct {
+	ID        uint      `gorm:"primarykey" json:"id"`
+	Name      string    `gorm:"uniqueIndex;size:64;not null" json:"name"`
+	Remark    string    `gorm:"size:255" json:"remark"`
+	Enabled   bool      `gorm:"not null;default:true" json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (u *User) IsAdmin() bool { return u.Role == RoleAdmin }
@@ -34,10 +47,47 @@ type Channel struct {
 	// ProtocolList 非数据库字段，AfterFind 里从 Protocols 展开，给前端用
 	ProtocolList []string  `gorm:"-" json:"protocols"`
 	BaseURL      string    `gorm:"size:512;not null" json:"base_url"`
-	APIKey       string    `gorm:"size:512" json:"api_key"`
 	Enabled      bool      `gorm:"not null;default:true" json:"enabled"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+
+	// Keys 该上游的所有 key（按归属划分），列表接口里带出来
+	Keys []ChannelKey `gorm:"foreignKey:ChannelID" json:"keys,omitempty"`
+}
+
+// ChannelKey 上游 key。同一个上游可以有很多 key，每把 key 归属于一个 Group；
+// 同一个上游 + 同一个归属下也可以配多把（由 key 选择策略挑一把，当前随机）。
+type ChannelKey struct {
+	ID         uint       `gorm:"primarykey" json:"id"`
+	ChannelID  uint       `gorm:"index:idx_channel_group;not null" json:"channel_id"`
+	GroupID    uint       `gorm:"index:idx_channel_group;not null" json:"group_id"`
+	Name       string     `gorm:"size:128" json:"name"`
+	Key        string     `gorm:"size:512;not null" json:"-"` // 不直接回传，用 KeyMasked
+	KeyMasked  string     `gorm:"-" json:"key_masked"`
+	Weight     int        `gorm:"not null;default:1" json:"weight"` // 预留：加权 / 亲和性
+	Enabled    bool       `gorm:"not null;default:true" json:"enabled"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+
+	Group *Group `gorm:"foreignKey:GroupID" json:"group,omitempty"`
+}
+
+// AfterFind 输出掩码，避免上游 key 明文出前端。
+func (k *ChannelKey) AfterFind(*gorm.DB) error {
+	k.KeyMasked = MaskSecret(k.Key)
+	return nil
+}
+
+// MaskSecret 只保留首尾各 4 位。
+func MaskSecret(s string) string {
+	if s == "" {
+		return ""
+	}
+	if len(s) <= 8 {
+		return "****"
+	}
+	return s[:4] + "****" + s[len(s)-4:]
 }
 
 // Model 对外暴露的模型名（客户端请求里填的 model）。
@@ -87,12 +137,16 @@ type RequestLog struct {
 	Endpoint         string    `gorm:"size:64" json:"endpoint"`       // 客户端请求的路径
 	UserID           uint      `gorm:"index" json:"user_id"`
 	Username         string    `gorm:"size:64" json:"username"`
+	GroupID          uint      `gorm:"index" json:"group_id"`
+	GroupName        string    `gorm:"size:64" json:"group_name"`
 	APIKeyID         uint      `gorm:"index" json:"api_key_id"`
 	APIKeyName       string    `gorm:"size:128" json:"api_key_name"`
 	ModelName        string    `gorm:"size:128;index" json:"model_name"`
 	ChannelID        uint      `json:"channel_id"`
 	ChannelName      string    `gorm:"size:128" json:"channel_name"`
 	UpstreamModel    string    `gorm:"size:128" json:"upstream_model"`
+	ChannelKeyID     uint      `json:"channel_key_id"`
+	ChannelKeyName   string    `gorm:"size:128" json:"channel_key_name"`
 	Stream           bool      `json:"stream"`
 	StatusCode       int       `json:"status_code"`
 	PromptTokens     int       `json:"prompt_tokens"`

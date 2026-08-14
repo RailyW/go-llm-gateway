@@ -31,7 +31,7 @@ func (p *AnthropicProtocol) BuildRequest(ctx context.Context, ch *store.Channel,
 		return nil, err
 	}
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("x-api-key", ch.APIKey)
+	r.Header.Set("x-api-key", req.APIKey)
 
 	version := defaultAnthropicVersion
 	if v := req.ClientHeader.Get("anthropic-version"); v != "" {
