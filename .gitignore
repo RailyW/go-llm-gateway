@@ -1,0 +1,18 @@
+# 依赖
+node_modules/
+# 构建产物
+bin/
+# 运行数据（sqlite + 归档原文）
+data/
+*.db
+*.db-shm
+*.db-wal
+# 杂项
+.DS_Store
+*.log
+.vscode/
+.idea/
+
+# 前端 embed 目录：只保留占位文件，产物由 make web 生成
+backend/internal/web/dist/*
+!backend/internal/web/dist/.gitkeep
