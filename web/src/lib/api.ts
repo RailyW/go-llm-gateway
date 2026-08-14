@@ -97,6 +97,41 @@ export interface LogItem {
   archive_path: string
   created_at: string
 }
+export interface SinkStats {
+  enqueued: number
+  dropped: number
+  persisted: number
+  batches: number
+  queue_len: number
+  queue_cap: number
+  last_flush_at: string
+  last_flush_ms: number
+  last_batch_len: number
+  last_error: string
+}
+export interface RegistryStats {
+  built_at: string
+  reloads: number
+  callers: number
+  models: number
+  key_sets: number
+}
+export interface Stats {
+  window: '1h' | '24h'
+  since: string
+  requests: number
+  errors: number
+  prompt_tokens: number
+  completion_tokens: number
+  keys: number
+  channels?: number
+  models?: number
+  users?: number
+  groups?: number
+  cleaner?: CleanerStatus
+  sink?: SinkStats
+  registry?: RegistryStats
+}
 export interface CleanerStatus {
   last_run_at: string | null
   next_run_at: string | null
@@ -145,7 +180,7 @@ export const api = {
   changePassword: (old_password: string, new_password: string) =>
     request<{ ok: boolean }>('/auth/password', { method: 'POST', body: body({ old_password, new_password }) }),
 
-  stats: () => request<Record<string, number | CleanerStatus>>('/stats'),
+  stats: (window: '1h' | '24h' = '1h') => request<Stats>(`/stats?window=${window}`),
 
   channels: () => request<Channel[]>('/channels'),
   channelKeys: (channelId: number) => request<ChannelKey[]>(`/channels/${channelId}/keys`),

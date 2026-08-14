@@ -20,6 +20,8 @@ const (
 	KeyDefaultGroupID        = "default_group_id"         // 新注册用户的默认归属
 	KeyAllowRegister         = "allow_register"           // 是否允许注册
 	KeyUpstreamTimeoutSecond = "upstream_timeout_seconds" // 上游超时（流式不受限）
+	KeyLogFlushIntervalMs    = "log_flush_interval_ms"    // 异步落库：攒批时间窗
+	KeyLogFlushBatch         = "log_flush_batch"          // 异步落库：单批最大条数
 )
 
 var defaults = map[string]string{
@@ -31,6 +33,8 @@ var defaults = map[string]string{
 	KeyDefaultGroupID:        "1",
 	KeyAllowRegister:         "true",
 	KeyUpstreamTimeoutSecond: "300",
+	KeyLogFlushIntervalMs:    "200",
+	KeyLogFlushBatch:         "200",
 }
 
 var (

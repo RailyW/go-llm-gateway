@@ -4,9 +4,9 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/RailyW/go-llm-gateway/backend/internal/auth"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"github.com/gin-gonic/gin"
-	"github.com/rin/go-llm-gateway/backend/internal/auth"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
 )
 
 // listKeys 普通用户看自己的；admin 加 ?all=1 看全部。

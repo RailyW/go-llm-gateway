@@ -5,11 +5,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RailyW/go-llm-gateway/backend/internal/auth"
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay"
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay/selector"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"github.com/gin-gonic/gin"
-	"github.com/rin/go-llm-gateway/backend/internal/auth"
-	"github.com/rin/go-llm-gateway/backend/internal/relay"
-	"github.com/rin/go-llm-gateway/backend/internal/relay/selector"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
 	"gorm.io/gorm"
 )
 

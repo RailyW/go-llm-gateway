@@ -3,9 +3,9 @@ package httpapi
 import (
 	"net/http"
 
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"github.com/gin-gonic/gin"
-	"github.com/rin/go-llm-gateway/backend/internal/relay"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
 )
 
 // listGatewayModels GET /v1/models —— 返回已启用且有可用绑定的模型，

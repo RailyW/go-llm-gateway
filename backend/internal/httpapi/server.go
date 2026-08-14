@@ -3,10 +3,13 @@ package httpapi
 import (
 	"net/http"
 
+	"github.com/RailyW/go-llm-gateway/backend/internal/archive"
+	"github.com/RailyW/go-llm-gateway/backend/internal/cleaner"
+	"github.com/RailyW/go-llm-gateway/backend/internal/config"
+	"github.com/RailyW/go-llm-gateway/backend/internal/registry"
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay"
+	"github.com/RailyW/go-llm-gateway/backend/internal/sink"
 	"github.com/gin-gonic/gin"
-	"github.com/rin/go-llm-gateway/backend/internal/cleaner"
-	"github.com/rin/go-llm-gateway/backend/internal/config"
-	"github.com/rin/go-llm-gateway/backend/internal/relay"
 	"gorm.io/gorm"
 )
 
@@ -14,12 +17,15 @@ type Server struct {
 	cfg      *config.Config
 	db       *gorm.DB
 	relay    *relay.Service
-	archiver *relay.Archiver
+	archiver *archive.Archiver
 	cleaner  *cleaner.Cleaner
+	reg      *registry.Registry
+	sink     sink.Sink
 }
 
-func NewServer(cfg *config.Config, db *gorm.DB, r *relay.Service, a *relay.Archiver, c *cleaner.Cleaner) *Server {
-	return &Server{cfg: cfg, db: db, relay: r, archiver: a, cleaner: c}
+func NewServer(cfg *config.Config, db *gorm.DB, r *relay.Service, a *archive.Archiver,
+	c *cleaner.Cleaner, reg *registry.Registry, sk sink.Sink) *Server {
+	return &Server{cfg: cfg, db: db, relay: r, archiver: a, cleaner: c, reg: reg, sink: sk}
 }
 
 // Router 装配所有路由。静态前端由 mountWeb 提供（embed dist）。
@@ -42,7 +48,8 @@ func (s *Server) Router() *gin.Engine {
 	v1.GET("/v1/models", s.listGatewayModels)
 
 	// ---------- 管理 API（JWT）----------
-	api := r.Group("/api")
+	// 任何写操作成功后同步重建配置快照，保证网关热路径立刻读到新配置
+	api := r.Group("/api", s.invalidateRegistryOnWrite())
 	{
 		api.POST("/auth/register", s.register)
 		api.POST("/auth/login", s.login)

@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rin/go-llm-gateway/backend/internal/relay"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
+	"github.com/RailyW/go-llm-gateway/backend/internal/archive"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"gorm.io/gorm"
 )
 
@@ -23,14 +23,14 @@ type Status struct {
 
 type Cleaner struct {
 	db       *gorm.DB
-	archiver *relay.Archiver
+	archiver *archive.Archiver
 
 	mu     sync.RWMutex
 	status Status
 	kick   chan struct{}
 }
 
-func New(db *gorm.DB, archiver *relay.Archiver) *Cleaner {
+func New(db *gorm.DB, archiver *archive.Archiver) *Cleaner {
 	return &Cleaner{db: db, archiver: archiver, kick: make(chan struct{}, 1)}
 }
 

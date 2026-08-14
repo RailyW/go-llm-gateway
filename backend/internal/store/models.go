@@ -14,7 +14,7 @@ type User struct {
 	PasswordHash string    `gorm:"not null" json:"-"`
 	Role         string    `gorm:"size:16;not null;default:user" json:"role"`
 	GroupID      uint      `gorm:"index;not null;default:1" json:"group_id"` // 归属（部门）
-	Enabled      bool      `gorm:"not null;default:true" json:"enabled"`
+	Enabled      bool      `gorm:"not null" json:"enabled"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 
@@ -26,7 +26,7 @@ type Group struct {
 	ID        uint      `gorm:"primarykey" json:"id"`
 	Name      string    `gorm:"uniqueIndex;size:64;not null" json:"name"`
 	Remark    string    `gorm:"size:255" json:"remark"`
-	Enabled   bool      `gorm:"not null;default:true" json:"enabled"`
+	Enabled   bool      `gorm:"not null" json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -47,7 +47,7 @@ type Channel struct {
 	// ProtocolList 非数据库字段，AfterFind 里从 Protocols 展开，给前端用
 	ProtocolList []string  `gorm:"-" json:"protocols"`
 	BaseURL      string    `gorm:"size:512;not null" json:"base_url"`
-	Enabled      bool      `gorm:"not null;default:true" json:"enabled"`
+	Enabled      bool      `gorm:"not null" json:"enabled"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 
@@ -65,7 +65,7 @@ type ChannelKey struct {
 	Key        string     `gorm:"size:512;not null" json:"-"` // 不直接回传，用 KeyMasked
 	KeyMasked  string     `gorm:"-" json:"key_masked"`
 	Weight     int        `gorm:"not null;default:1" json:"weight"` // 预留：加权 / 亲和性
-	Enabled    bool       `gorm:"not null;default:true" json:"enabled"`
+	Enabled    bool       `gorm:"not null" json:"enabled"`
 	LastUsedAt *time.Time `json:"last_used_at"`
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
@@ -95,7 +95,7 @@ type Model struct {
 	ID        uint      `gorm:"primarykey" json:"id"`
 	Name      string    `gorm:"uniqueIndex;size:128;not null" json:"name"`
 	Remark    string    `gorm:"size:255" json:"remark"`
-	Enabled   bool      `gorm:"not null;default:true" json:"enabled"`
+	Enabled   bool      `gorm:"not null" json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
@@ -110,7 +110,7 @@ type Binding struct {
 	ChannelID     uint      `gorm:"index;not null" json:"channel_id"`
 	UpstreamModel string    `gorm:"size:128;not null" json:"upstream_model"`
 	Weight        int       `gorm:"not null;default:1" json:"weight"` // 预留：加权策略用
-	Enabled       bool      `gorm:"not null;default:true" json:"enabled"`
+	Enabled       bool      `gorm:"not null" json:"enabled"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 
@@ -123,7 +123,7 @@ type APIKey struct {
 	UserID     uint       `gorm:"index;not null" json:"user_id"`
 	Name       string     `gorm:"size:128" json:"name"`
 	Key        string     `gorm:"uniqueIndex;size:128;not null" json:"key"`
-	Enabled    bool       `gorm:"not null;default:true" json:"enabled"`
+	Enabled    bool       `gorm:"not null" json:"enabled"`
 	LastUsedAt *time.Time `json:"last_used_at"`
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`

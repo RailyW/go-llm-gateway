@@ -1,4 +1,4 @@
-module github.com/rin/go-llm-gateway/backend
+module github.com/RailyW/go-llm-gateway/backend
 
 go 1.26.6
 

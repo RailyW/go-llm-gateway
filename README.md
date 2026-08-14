@@ -32,6 +32,57 @@
 请求体除了把 `model` 换成上游模型名之外**原样透传**，响应（含 SSE 流）**原样回吐**。
 上游录入时勾选它支持哪些协议端点；路由时只有勾了对应协议的绑定才参与选择。
 
+## 性能：热路径不落库
+
+早期实现每个请求在 handler 里同步做 7 次 SELECT + 2 次文件写 + 3 次写事务（1 条日志 INSERT +
+2 条 `last_used_at` UPDATE）。sqlite 是**全局单写者**且每次 commit 一次 fsync，于是：
+
+- 吞吐被压在 ~220 RPS，且 **c=1 和 c=50 的 RPS 一样**（说明是全局串行，加并发没用）
+- p99 2.5s、单条 INSERT 最慢 4.4s（`busy_timeout` 是 5s，再高一点就开始静默丢日志）
+- 网关自己记的 `duration_ms` 却是 p50=0ms —— 时间全花在响应发出**之后**的落库上
+
+现在的做法（同一台机器、同一个空转上游、非流式最小请求）：
+
+| 场景 | RPS | p50 | p99 | max |
+| --- | --- | --- | --- | --- |
+| 直连上游（基线，不经网关） | 59,401 | 0.58ms | 4.6ms | 11ms |
+| 改造前 c=50 | 219 | 41ms | 2.50s | 5.05s |
+| **改造后 c=50** | **16,698** | **2.2ms** | **21.9ms** | 25.5ms |
+| **改造后 c=200** | **20,263** | 8.5ms | 31.1ms | 52.1ms |
+| 改造前 c=1 | 225 | 4.26ms | 6.9ms | 9.9ms |
+| **改造后 c=1** | **4,270** | **0.18ms** | 1.9ms | 3.2ms |
+
+吞吐 **76 倍**，p99 好 **114 倍**，单请求净开销 4.26ms → 0.18ms。四件事：
+
+1. **`synchronous=NORMAL`**（WAL 下每次 commit 不再 fsync）。实测单条写入 1.575ms → 0.177ms（9 倍）。
+   代价：机器掉电/内核崩溃可能丢最近几个事务，不会损坏数据库——对请求日志这类观测数据划算。
+2. **日志与归档异步批量落库**（`internal/sink`）。请求只把 Entry 丢进有界队列；后台协程攒批，
+   在**单个事务**里批量 INSERT，一批只有一次 fsync。实测批量 0.093ms/条 vs 逐条 1.575ms（17 倍）。
+3. **`last_used_at` 合并**。这字段是 last-write-wins，天生可合并：每批只发 1 条
+   `UPDATE ... WHERE id IN (...)`，而不是每请求 2 条。写事务从 3/请求降到 3/批。
+4. **配置内存快照**（`internal/registry`）。网关 key、用户、归属、模型、绑定、上游 key
+   全量缓存，用 `atomic.Pointer` 发布，热路径**零查询零锁**。任何管理 API 的写操作成功后
+   由中间件同步重建快照（保证"改完立刻生效"），另有 30s 兜底刷新。
+
+### 异步落库的代价（都是显式选择）
+
+- **队列满会丢日志**（不阻塞转发）。实测落库上限约 **8k~13k 条/s**（瓶颈是 GORM 每行序列化，
+  加大攒批帮助不大）；超过就开始丢。丢弃数、队列占用、上批耗时全部显示在概览页
+  「异步落库管道」卡片里 —— **隐性丢数据是不可接受的，所以必须可见**。
+- **日志有可见延迟**（默认 ≤200ms 或攒满 200 条）。攒批间隔/条数在设置页可调。
+- **崩溃丢最后一批**。`SIGTERM` 优雅退出会先停 HTTP、再把队列刷完（实测入队 421 / 落库 421 / 丢弃 0）；
+  `kill -9` 则丢最后一批。
+- **写顺序**：每批先写归档文件、再插日志行，保证「日志里能看到的请求，原文一定已存在」。
+
+### 流式响应不再攒内存
+
+原先流式响应为了归档会把整个 SSE 攒在内存（每请求上限 8MB），20 个并发长回答就是 160MB。
+现在是**边转发边追加写文件**（64KB bufio），实测 20 个并发 × 12MB 流式响应：
+进程 RSS 仅 +19MB，归档文件完整 12.2MB 落盘。
+
+概览页的统计只按**时间窗口**（1 小时 / 1 天）查询，不做全表 `COUNT/SUM`——
+logs 表会一直增长，全表扫描的首页迟早会拖垮。更长周期的统计等以后做小时级 rollup。
+
 ## 功能范围
 
 | 模块 | 说明 |
@@ -105,7 +156,10 @@ backend/
     relay.go                      转发主流程（协议无关：选上游 → 按归属选 key → 改模型名 → 直转 → 落日志）
     selector/selector.go          ★ 上游绑定选择策略（random / weighted）
     keyselector/keyselector.go    ★ 上游 key 选择策略（random / weighted / affinity-hash）
-    archive.go                    请求/响应原文归档与按天清理
+                                  （relay 热路径只读 registry 快照 + 投递 sink，不碰数据库）
+  internal/archive/               请求/响应原文归档（流式为增量写文件）+ 按天清理
+  internal/sink/                  ★ 异步批量落库管道（接口化，可换 Redis Stream 实现）
+  internal/registry/              ★ 配置内存快照，转发热路径零查询
   internal/cleaner/               后台清理服务
   internal/httpapi/               gin 路由、中间件、各资源 handler、静态前端挂载
   internal/web/                   //go:embed dist（前端产物）
@@ -118,7 +172,8 @@ scripts/mock_upstream.py          本地 mock 上游
 - sqlite：`data/gateway.db`（纯 Go 驱动，无需 CGO）
 - 归档原文：`data/archive/<YYYY-MM-DD>/<request-id>.request.json` 与 `<request-id>.response.txt`
   - `request.json` 含元信息（用户、key、模型、上游 URL）+ 客户端原始 body
-  - `response.txt` 非流式为完整响应体，流式为完整 SSE 文本（单文件上限 8MB）
+  - `response.txt` 非流式为完整响应体，流式为完整 SSE 文本（边转发边追加写，单文件上限 32MB 后截断）
+  - 文件由异步管道在后台写入（每批先写文件、再插日志行）
   - 日志页点「原文」即读取这两个文件；被清理后提示已删除
 
 ## 环境变量
@@ -132,9 +187,10 @@ scripts/mock_upstream.py          本地 mock 上游
 | `GATEWAY_JWT_SECRET` | `dev-insecure-...` | **生产务必修改** |
 | `GATEWAY_ADMIN_USER/PASS` | `admin` / `admin` | 初始管理员（仅无 admin 时创建） |
 | `GATEWAY_ALLOW_REGISTER` | `true` | 是否允许自助注册（也可在设置页改） |
+| `GATEWAY_LOG_QUEUE_SIZE` | `8192` | 异步落库队列容量（满了丢日志，不阻塞转发） |
 
 WebUI 可改的运行时配置：归档保留天数、日志保留天数、清理间隔、上游绑定路由策略、**上游 key 选择策略**、
-**新用户默认归属**、上游超时、注册开关。
+**新用户默认归属**、上游超时、注册开关、**异步落库攒批间隔/条数**。
 
 老库升级说明：启动时若发现旧的 `channels.api_key` 列，会自动把它迁成 `default` 归属下的一把 `ChannelKey` 并删除该列。
 
@@ -163,6 +219,11 @@ type Protocol interface {
 三个已实现协议的差异就只有：**路径、鉴权头、usage 字段、错误体格式**——body 不碰。
 
 **加一个上游选择策略**（如轮询、最少失败）：在 `internal/relay/selector/` 实现 `Selector` 并 `Register`。
+
+**把落库换成 Redis / ClickHouse**：`sink.Sink` 是接口（`Submit` / `Stats` / `Close`），
+换一个 Redis Stream 实现即可，请求侧代码不动。判据是**要不要多实例**：单实例下进程内队列
+比 Redis 少一次 RTT、少一个可用性依赖，而 Redis 默认 AOF everysec 的丢失窗口跟攒批是同量级。
+真正需要 Redis 的场景是：多实例共享缓存失效/限流计数、配额原子扣减（这类**必须同步**，不能进异步管道）。
 
 **加一个上游 key 选择策略**（如按会话亲和、按剩余额度）：在 `internal/relay/keyselector/` 实现 `Selector` 并 `Register`。
 `Context` 里已经带了 channel/group/user/网关key/模型/协议/`AffinityKey`，够做亲和性。

@@ -189,6 +189,8 @@ export default function SettingsPage() {
               </Select>
             </div>
             {num('upstream_timeout_seconds', '上游超时（秒）', '非流式请求的超时；流式请求不设整体超时')}
+            {num('log_flush_interval_ms', '异步落库攒批间隔（毫秒）', '日志/归档不在请求路径上写：攒够一批或到时间才落一次库。越大吞吐越高，崩溃丢失窗口也越大')}
+            {num('log_flush_batch', '异步落库单批最大条数', '一批在单个事务里插入，只有一次 fsync。实测批量比逐条快 ~17 倍')}
             <div className="flex items-center justify-between rounded-md border border-border p-3">
               <div>
                 <Label>允许自助注册</Label>

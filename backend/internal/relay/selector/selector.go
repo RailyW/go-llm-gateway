@@ -10,7 +10,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/rin/go-llm-gateway/backend/internal/store"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 )
 
 var ErrNoCandidate = errors.New("no available upstream binding")

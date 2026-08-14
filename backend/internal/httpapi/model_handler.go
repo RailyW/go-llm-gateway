@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"github.com/gin-gonic/gin"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
 	"gorm.io/gorm"
 )
 

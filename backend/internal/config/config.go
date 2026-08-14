@@ -16,6 +16,7 @@ type Config struct {
 	AdminUser     string // 初始管理员用户名
 	AdminPass     string // 初始管理员密码
 	AllowRegister bool   // 是否允许自助注册
+	LogQueueSize  int    // 异步落库队列容量（满了丢日志，不阻塞转发）
 }
 
 func Load() *Config {
@@ -29,6 +30,7 @@ func Load() *Config {
 		AdminUser:     env("GATEWAY_ADMIN_USER", "admin"),
 		AdminPass:     env("GATEWAY_ADMIN_PASS", "admin"),
 		AllowRegister: envBool("GATEWAY_ALLOW_REGISTER", true),
+		LogQueueSize:  envInt("GATEWAY_LOG_QUEUE_SIZE", 8192),
 	}
 	return c
 }
@@ -36,6 +38,15 @@ func Load() *Config {
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
 	}
 	return def
 }

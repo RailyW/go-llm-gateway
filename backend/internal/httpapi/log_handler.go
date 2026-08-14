@@ -3,9 +3,10 @@ package httpapi
 import (
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"github.com/gin-gonic/gin"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
 	"gorm.io/gorm"
 )
 
@@ -88,46 +89,71 @@ func (s *Server) visibleLog(c *gin.Context) (*store.RequestLog, bool) {
 }
 
 // stats 首页概览。
+//
+// 只统计一个**时间窗口**内的数据（1h / 24h），不做全表 COUNT/SUM：
+// logs 表会一直增长，全表扫描的概览接口迟早会拖垮首页。
+// 更长周期的统计等以后做小时级 rollup 再说。
 func (s *Server) stats(c *gin.Context) {
 	u := currentUser(c)
-	out := gin.H{}
 
-	// 普通用户只统计自己的
-	mine := func(q *gorm.DB) *gorm.DB {
+	window := 1 * time.Hour
+	label := "1h"
+	if c.Query("window") == "24h" {
+		window, label = 24*time.Hour, "24h"
+	}
+	since := time.Now().Add(-window)
+
+	// 普通用户只统计自己的；同时始终带上时间窗口（命中 created_at 索引）
+	scoped := func() *gorm.DB {
+		q := s.db.Model(&store.RequestLog{}).Where("created_at >= ?", since)
 		if !u.IsAdmin() {
-			return q.Where("user_id = ?", u.ID)
+			q = q.Where("user_id = ?", u.ID)
 		}
 		return q
 	}
 
-	var requests, errCount, keys int64
-	mine(s.db.Model(&store.RequestLog{})).Count(&requests)
-	mine(s.db.Model(&store.RequestLog{})).Where("status_code >= 400").Count(&errCount)
-	mine(s.db.Model(&store.APIKey{})).Count(&keys)
+	var requests, errCount int64
+	scoped().Count(&requests)
+	scoped().Where("status_code >= 400").Count(&errCount)
 
 	var tokens struct {
 		Prompt     int64
 		Completion int64
 	}
-	mine(s.db.Model(&store.RequestLog{})).
-		Select("COALESCE(SUM(prompt_tokens),0) as prompt, COALESCE(SUM(completion_tokens),0) as completion").
+	scoped().Select("COALESCE(SUM(prompt_tokens),0) as prompt, COALESCE(SUM(completion_tokens),0) as completion").
 		Scan(&tokens)
 
-	out["requests"] = requests
-	out["errors"] = errCount
-	out["keys"] = keys
-	out["prompt_tokens"] = tokens.Prompt
-	out["completion_tokens"] = tokens.Completion
+	// key 数量与日志无关，是小表，直接算
+	var keys int64
+	keyQ := s.db.Model(&store.APIKey{})
+	if !u.IsAdmin() {
+		keyQ = keyQ.Where("user_id = ?", u.ID)
+	}
+	keyQ.Count(&keys)
+
+	out := gin.H{
+		"window":            label,
+		"since":             since,
+		"requests":          requests,
+		"errors":            errCount,
+		"prompt_tokens":     tokens.Prompt,
+		"completion_tokens": tokens.Completion,
+		"keys":              keys,
+	}
 
 	if u.IsAdmin() {
-		var channels, models, users int64
+		var channels, models, users, groups int64
 		s.db.Model(&store.Channel{}).Count(&channels)
 		s.db.Model(&store.Model{}).Count(&models)
 		s.db.Model(&store.User{}).Count(&users)
+		s.db.Model(&store.Group{}).Count(&groups)
 		out["channels"] = channels
 		out["models"] = models
 		out["users"] = users
+		out["groups"] = groups
 		out["cleaner"] = s.cleaner.Status()
+		out["sink"] = s.sink.Stats()    // 异步落库管道健康度（丢弃必须可见）
+		out["registry"] = s.reg.Stats() // 配置快照状态
 	}
 	c.JSON(http.StatusOK, out)
 }

@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
+	webassets "github.com/RailyW/go-llm-gateway/backend/internal/web"
 	"github.com/gin-gonic/gin"
-	webassets "github.com/rin/go-llm-gateway/backend/internal/web"
 )
 
 // mountWeb 挂载内嵌前端，SPA 路由回退到 index.html。

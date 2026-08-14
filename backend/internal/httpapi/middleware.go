@@ -1,13 +1,14 @@
 package httpapi
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
+	"github.com/RailyW/go-llm-gateway/backend/internal/auth"
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"github.com/gin-gonic/gin"
-	"github.com/rin/go-llm-gateway/backend/internal/auth"
-	"github.com/rin/go-llm-gateway/backend/internal/relay"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
 )
 
 const (
@@ -53,7 +54,8 @@ func (s *Server) AdminOnly() gin.HandlerFunc {
 	}
 }
 
-// GatewayAuth 校验本网关发放的 sk- key，返回 OpenAI 风格错误。
+// GatewayAuth 校验本网关发放的 sk- key。
+// 全程只读内存快照（registry），热路径不查库。
 func (s *Server) GatewayAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := auth.BearerToken(c.GetHeader("Authorization"))
@@ -64,36 +66,32 @@ func (s *Server) GatewayAuth() gin.HandlerFunc {
 			openaiError(c, http.StatusUnauthorized, "缺少或非法的 API key")
 			return
 		}
-		var k store.APIKey
-		if err := s.db.Where("key = ?", key).First(&k).Error; err != nil {
+		caller, ok := s.reg.Get().Caller(key)
+		if !ok {
 			openaiError(c, http.StatusUnauthorized, "API key 无效")
 			return
 		}
-		if !k.Enabled {
+		if !caller.APIKeyEnabled {
 			openaiError(c, http.StatusForbidden, "API key 已禁用")
 			return
 		}
-		var u store.User
-		if err := s.db.Preload("Group").First(&u, k.UserID).Error; err != nil || !u.Enabled {
+		if caller.UserID == 0 || !caller.UserEnabled {
 			openaiError(c, http.StatusForbidden, "所属用户不可用")
 			return
 		}
-		if u.Group != nil && !u.Group.Enabled {
-			openaiError(c, http.StatusForbidden, "所属归属("+u.Group.Name+")已被禁用")
+		if caller.GroupID != 0 && !caller.GroupEnabled {
+			openaiError(c, http.StatusForbidden, "所属归属("+caller.GroupName+")已被禁用")
 			return
 		}
-		actor := relay.Actor{
-			UserID:     u.ID,
-			Username:   u.Username,
-			GroupID:    u.GroupID,
-			APIKeyID:   k.ID,
-			APIKeyName: k.Name,
+		c.Set(ctxActor, relay.Actor{
+			UserID:     caller.UserID,
+			Username:   caller.Username,
+			GroupID:    caller.GroupID,
+			GroupName:  caller.GroupName,
+			APIKeyID:   caller.APIKeyID,
+			APIKeyName: caller.APIKeyName,
 			ClientIP:   c.ClientIP(),
-		}
-		if u.Group != nil {
-			actor.GroupName = u.Group.Name
-		}
-		c.Set(ctxActor, actor)
+		})
 		c.Next()
 	}
 }
@@ -119,4 +117,21 @@ func openaiError(c *gin.Context, status int, msg string) {
 		"type":    "gateway_error",
 		"code":    status,
 	}})
+}
+
+// invalidateRegistryOnWrite 管理 API 的写操作成功后，同步重建配置快照。
+// 放在中间件里而不是散落在各 handler，避免以后新增接口忘记失效。
+func (s *Server) invalidateRegistryOnWrite() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			return
+		}
+		if c.Writer.Status() >= 400 {
+			return
+		}
+		if err := s.reg.Invalidate(); err != nil {
+			log.Printf("[registry] 重建配置快照失败: %v", err)
+		}
+	}
 }

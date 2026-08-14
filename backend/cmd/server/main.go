@@ -10,13 +10,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rin/go-llm-gateway/backend/internal/auth"
-	"github.com/rin/go-llm-gateway/backend/internal/cleaner"
-	"github.com/rin/go-llm-gateway/backend/internal/config"
-	"github.com/rin/go-llm-gateway/backend/internal/httpapi"
-	"github.com/rin/go-llm-gateway/backend/internal/relay"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
-	webassets "github.com/rin/go-llm-gateway/backend/internal/web"
+	"github.com/RailyW/go-llm-gateway/backend/internal/archive"
+	"github.com/RailyW/go-llm-gateway/backend/internal/auth"
+	"github.com/RailyW/go-llm-gateway/backend/internal/cleaner"
+	"github.com/RailyW/go-llm-gateway/backend/internal/config"
+	"github.com/RailyW/go-llm-gateway/backend/internal/httpapi"
+	"github.com/RailyW/go-llm-gateway/backend/internal/registry"
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay"
+	"github.com/RailyW/go-llm-gateway/backend/internal/sink"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
+	webassets "github.com/RailyW/go-llm-gateway/backend/internal/web"
 )
 
 func main() {
@@ -32,27 +35,39 @@ func main() {
 	}
 	auth.Init(cfg.JWTSecret)
 
-	archiver := relay.NewArchiver(cfg.ArchiveDir)
+	archiver := archive.NewArchiver(cfg.ArchiveDir)
 	if err := os.MkdirAll(cfg.ArchiveDir, 0o755); err != nil {
 		log.Fatalf("创建归档目录失败: %v", err)
 	}
 
-	relaySvc := relay.NewService(db, archiver)
+	// 配置内存快照：转发热路径不查库
+	reg, err := registry.New(db)
+	if err != nil {
+		log.Fatalf("初始化配置快照失败: %v", err)
+	}
+
+	// 异步落库管道：日志与归档都不在请求路径上写
+	logSink := sink.NewBatch(db, archiver, cfg.LogQueueSize)
+	logSink.Start()
+
+	relaySvc := relay.NewService(reg, logSink, archiver)
 	cl := cleaner.New(db, archiver)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	cl.Start(ctx)
+	reg.StartRefresher(ctx, 30*time.Second)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           httpapi.NewServer(cfg, db, relaySvc, archiver, cl).Router(),
+		Handler:           httpapi.NewServer(cfg, db, relaySvc, archiver, cl, reg, logSink).Router(),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
 	go func() {
 		log.Printf("[boot] 监听 http://localhost:%s  (数据目录 %s, 前端内嵌=%v)", cfg.Port, cfg.DataDir, webassets.Built())
-		log.Printf("[boot] 网关端点 POST http://localhost:%s/v1/chat/completions", cfg.Port)
+		log.Printf("[boot] 网关端点 POST http://localhost:%s/v1/chat/completions | /v1/responses | /v1/messages", cfg.Port)
+		log.Printf("[boot] 异步落库队列容量 %d", cfg.LogQueueSize)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("服务启动失败: %v", err)
 		}
@@ -60,7 +75,14 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("[shutdown] 正在退出...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	// 先停止收新请求，再把异步队列里剩下的日志/归档刷完，尽量不丢
 	_ = srv.Shutdown(shutdownCtx)
+	if err := logSink.Close(shutdownCtx); err != nil {
+		log.Printf("[shutdown] 落库队列未完全刷完: %v", err)
+	} else {
+		s := logSink.Stats()
+		log.Printf("[shutdown] 落库队列已刷完（累计入队 %d / 落库 %d / 丢弃 %d）", s.Enqueued, s.Persisted, s.Dropped)
+	}
 }

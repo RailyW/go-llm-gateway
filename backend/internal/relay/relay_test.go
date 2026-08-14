@@ -5,9 +5,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/rin/go-llm-gateway/backend/internal/relay/keyselector"
-	"github.com/rin/go-llm-gateway/backend/internal/relay/selector"
-	"github.com/rin/go-llm-gateway/backend/internal/store"
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay/keyselector"
+	"github.com/RailyW/go-llm-gateway/backend/internal/relay/selector"
+	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 )
 
 func TestJoinURL(t *testing.T) {
