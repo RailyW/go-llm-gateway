@@ -50,7 +50,10 @@ func (r Role) ServesHTTP() bool { return r != RoleWorker }
 // all/worker 会参与，但需要抢到分布式锁才真正执行（见 cleaner 选主）。
 func (r Role) RunsCleaner() bool { return r == RoleAll || r == RoleWorker }
 
-// ConsumesLogs 是否消费日志队列并写库。
+// ConsumesLogs 是否消费日志并写 PostgreSQL。
+//
+// all 自己转发的日志直接落库（单进程没必要绕 Redis 一圈），
+// 同时它也会消费 Redis Stream —— 这样「1 个 all + N 个 gateway」的部署方式成立。
 func (r Role) ConsumesLogs() bool { return r == RoleAll || r == RoleWorker }
 
 // NeedsRegistry 是否需要配置快照（转发要用；console 自己查库不用快照，

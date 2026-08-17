@@ -40,7 +40,7 @@
 | 角色 | 对外 | PostgreSQL | 职责 |
 | --- | --- | --- | --- |
 | `all`（默认） | `/v1/*` + `/api/*` + WebUI | 读写（池 32） | 单进程全功能，本地开发与小规模部署 |
-| `gateway` | 只有 `/v1/*` | **只读，且只在启动/失效时读**（池 8） | 只转发，**可横向扩展** |
+| `gateway` | 只有 `/v1/*` | **只读，且只在启动/失效时读**（池 8） | 只转发，日志投给 Redis Stream，**可横向扩展** |
 | `console` | 只有 `/api/*` + WebUI | 读写（池 32） | 管理台，不接转发流量 |
 | `worker` | 只有 `/healthz` | 只写日志（池 32） | 消费日志队列 + 清理（需选主） |
 
@@ -59,7 +59,8 @@ Redis 只做**跨实例才需要的事**，不碰热路径数据：
 | --- | --- |
 | 配置失效广播（Pub/Sub） | 管理台改完配置，各转发实例**立刻**重建本地快照。实测 0.3 秒内生效，此前要等 30 秒兜底轮询 |
 | 单例任务选主 | 清理任务只能有一个执行者，否则 N 个实例并发删同一批数据 |
-| 实例心跳 | 各实例把状态写进 Redis（带 TTL），管理台聚合成「集群」视图 |
+| 实例心跳 | 各实例把状态写进 Redis（带 TTL 15 秒），管理台聚合成「集群」视图 |
+| 日志队列（Streams） | gateway 把日志投进 Stream，worker 消费后批量落 PG。**杀 worker 不丢日志** |
 | （后续）限流/配额/并发数 | 唯一必须同步、原子、跨实例的能力 |
 
 **不交给 Redis 的**：配置快照本体仍在各实例本地内存（`atomic.Pointer`，纳秒级）。
@@ -86,14 +87,74 @@ Redis 挂了网关继续转发。这是显式选择：Redis 承担的是限流/�
 单实例（未配置 Redis）时一切照旧：选主进入 solo 模式直接视为 leader，
 否则本地开发会永远不清理。
 
+### 日志怎么从 gateway 到 PostgreSQL
+
+三种形态，取决于角色和有没有 Redis：
+
+| 部署 | 日志路径 |
+| --- | --- |
+| `all` / `worker` | 本地攒批 → 直接 COPY 落 PG（单进程没必要绕 Redis 一圈） |
+| `gateway` + Redis | 本地攒批 → `XADD` 进 Stream → worker `XREADGROUP` → 落 PG |
+| `gateway` 无 Redis | 丢弃（配置错误：横向扩展必须有 Redis）。转发照常，但会显式告警 |
+
+`all` / `worker` 在配了 Redis 时**同时**消费 Stream，所以
+「1 个 all + N 个 gateway」和「1 console + N gateway + 1 worker」两种拓扑都成立。
+
+#### 请求协程不做 XADD
+
+这条最容易做错。`XADD` 是一次网络往返（本机 ~50µs，跨机 ~500µs），
+放进请求协程等于把「同步写 PG」换成了「同步写 Redis」——热路径又多一个
+能抖动、能变慢、能挂掉的依赖。所以结构和进程内攒批完全一样，只是 flush 的目的地不同：
+
+```
+请求协程 → 本地有界 chan（非阻塞，满了丢弃并计数）
+           ↓ 后台协程攒批（200 条 / 200ms）
+         XADD pipeline 一次送一批 → Redis Stream
+                                    ↓ XREADGROUP（一批 1000 条）
+                                  worker 落库 → XACK
+```
+
+pipeline 是必须的：200 条日志从 200 次往返压成 1 次，否则攒批就白攒了。
+
+#### 落库成功才 XACK
+
+**顺序反过来（读完就 ACK 再慢慢落库）的话，Streams 就退化成一个更慢、更复杂的
+进程内队列**——worker 崩溃时那批数据一样丢。整个方案的价值就在这一个顺序上。
+
+配套的三件事，少一件就会漏数据：
+
+| 机制 | 解决什么 |
+| --- | --- |
+| `XAUTOCLAIM`（每 30 秒） | worker 被 `kill -9` 后，它名下未 ACK 的消息永远不会自动重投（消费组认为「已经投递给某个 consumer 了」，而那个 consumer 再也不回来）。必须主动接管 |
+| 投递次数上限（5 次） | 某条消息总是让落库失败（比如触发约束）时，无限重试会堵住后面所有日志。超限就单独丢弃并告警——宁可丢一条并说出来 |
+| `XTRIM MINID`（pending 归零时） | `XACK` **不删除消息**，Stream 会一直长到 MAXLEN（100 万条 ≈ 400MB）常驻内存。已落 PG 的副本留在 Redis 里毫无价值 |
+
+实测（4 个实例：1 console + 2 gateway + 1 worker）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 2 个 gateway 各压 15000 请求 | 30000 条日志全部落库，**丢弃 0** |
+| `kill -9` worker，期间转发 60 次 | 转发不受影响；日志在 Stream 里排队；worker 重启后 **80/80 全部补上** |
+| 制造「已投递未 ACK」遗留 10 条 | 新 worker 在 60 秒（`ClaimMinIdle`）后 `XAUTOCLAIM` 接管，**10 条全部补上**，pending 归 0 |
+| 停掉 Redis | 转发照常（fail-open），日志计入丢弃并在概览页可见 |
+
+#### 积压看 lag，不要看 XLEN
+
+`XLEN` 是「历史总条数」而不是积压（因为 XACK 不删消息）。用它当积压会显示一个
+永远不归零的数字，运维就再也不会相信这个指标了。真正的积压是
+`XINFO GROUPS` 的 `lag`。这个坑是实测踩到的：压测完 `XLEN=90` 而 `lag=0`。
+
+#### 仍然存在的丢失窗口
+
+gateway 侧是**最多一次**：本地 chan 里还没 `XADD` 出去的那部分，
+进程被 `kill -9` 就没了（优雅退出会 flush）。要端到端不丢就得在请求协程里同步 XADD，
+而那正是上面拒绝的事情。**这是一个明确的权衡，不是遗漏。**
+
 ### 当前的已知缺口
 
-- **gateway 角色转发的请求日志会被丢弃**。它已经不直连 PG 写日志了（这是解耦的目的），
-  但 Redis Streams 队列还没接，所以日志暂时没有去处。集群视图里会用红色标出丢弃数，
-  启动日志也会显式警告。需要完整日志时用 `role=all` 单实例部署。
-- **原文归档功能已停用**（`store.ArchiveFeatureEnabled = false`）。它写本地磁盘，
-  而请求落在哪个实例是不确定的，管理台根本读不到那个文件。代码全部保留，
-  等换成共享存储（S3/MinIO）后再开。
+**原文归档功能已停用**（`store.ArchiveFeatureEnabled = false`）。它写本地磁盘，
+而请求落在哪个实例是不确定的，管理台根本读不到那个文件。代码全部保留，
+读原文接口返回 501 并说明原因，等换成共享存储（S3/MinIO）后再开。
 
 ## 存储选型：PostgreSQL + 磁盘归档
 
@@ -382,6 +443,8 @@ scripts/mock_upstream.py          本地 mock 上游
 | `GATEWAY_REDIS_ADDR` | 空 | 不配则为单实例模式（无广播、无选主） |
 | `GATEWAY_REDIS_PASSWORD` / `_DB` / `_PREFIX` | — / `0` / `gw` | |
 | `GATEWAY_REDIS_TIMEOUT_MS` | `50` | 单次命令超时；慢比挂危险 |
+| `GATEWAY_LOG_STREAM_MAXLEN` | `1000000` | Stream 长度上限（≈400MB）。必须有界，否则 worker 挂掉会吃光 Redis |
+| `GATEWAY_LOG_STREAM_BATCH` | `1000` | worker 单次取多少条（决定落库批大小） |
 | `GATEWAY_TEST_REDIS_ADDR` | 无 | 协调层测试用；不设则跳过 |
 
 启动时会读当前目录的 `.env`（见 `.env.example`），**已存在的真实环境变量不会被覆盖**。
@@ -418,9 +481,9 @@ type Protocol interface {
 
 **加一个上游选择策略**（如轮询、最少失败）：在 `internal/relay/selector/` 实现 `Selector` 并 `Register`。
 
-**接入 Redis Streams**：让 gateway 角色 `XADD` 进队列、worker 消费后批量写 PG。
-这样转发实例既不连 PG 写库、也不丢日志，而且网关重启不丢（现在 `kill -9` 会丢最后一批）。
-`sink.Sink` 是接口，现在的进程内实现原地留着当 Redis 不可用时的降级路径。
+**日志改投 ClickHouse**：Stream 上再挂一个消费组即可（`XREADGROUP` 的组之间互不影响），
+不用改生产端。这也是 `XTRIM` 用 `MINID` 而不是 `MAXLEN` 的原因——
+按 MAXLEN 裁会伤到消费慢的那个组。
 
 **限流 / 配额 / 并发数**：这是唯一「必须同步、原子、跨实例」的能力，只能靠 Redis
 （`INCR`+`EXPIRE` 或 Lua 令牌桶）。对 LLM 网关**并发数限制比 RPS 更重要**——

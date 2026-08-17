@@ -26,6 +26,7 @@ type Server struct {
 	rc       *rds.Client
 	inval    *coord.Invalidator
 	hb       *coord.Heartbeat
+	consumer *sink.Consumer
 }
 
 // Deps 构造 Server 需要的依赖。用结构体而不是长参数列表：
@@ -41,12 +42,15 @@ type Deps struct {
 	Redis     *rds.Client
 	Inval     *coord.Invalidator
 	Heartbeat *coord.Heartbeat
+	// Consumer worker/all 角色的 Stream 消费者（其他角色为 nil）
+	Consumer *sink.Consumer
 }
 
 func NewServer(d Deps) *Server {
 	return &Server{
 		cfg: d.Cfg, db: d.DB, relay: d.Relay, archiver: d.Archiver,
 		cleaner: d.Cleaner, reg: d.Registry, sink: d.Sink, rc: d.Redis, inval: d.Inval, hb: d.Heartbeat,
+		consumer: d.Consumer,
 	}
 }
 

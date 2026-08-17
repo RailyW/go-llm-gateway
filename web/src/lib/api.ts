@@ -110,6 +110,32 @@ export interface SinkStats {
   last_error: string
   using_copy: boolean
   active: boolean
+  /** 日志去处：postgres = 直接落库，redis-stream = 投给 worker */
+  via?: string
+}
+
+export interface ConsumerStats {
+  running: boolean
+  /** 消费组还没读到的消息数（lag）。注意不是 XLEN —— XACK 不删消息 */
+  backlog: number
+  /** Stream 物理长度（占着 Redis 内存的消息数） */
+  length: number
+  pending: number
+  consumed: number
+  persisted: number
+  trimmed: number
+  retried: number
+  poisoned: number
+  batches: number
+  failed: number
+  last_at?: string
+  last_ms: number
+  last_len: number
+  last_error?: string
+  group: string
+  stream_key: string
+  using_copy: boolean
+  consumer: string
 }
 export interface RegistryStats {
   built_at: string
@@ -143,9 +169,9 @@ export interface Peer {
   at: string
   port?: string
   persists?: boolean
-  logs_dropped?: number
   sink?: SinkStats
   registry?: RegistryStats
+  consumer?: ConsumerStats
 }
 
 export interface Stats {
@@ -167,6 +193,7 @@ export interface Stats {
   redis?: RedisStats
   invalidate?: Record<string, unknown>
   cluster?: Peer[]
+  consumer?: ConsumerStats
 }
 export interface CleanerStatus {
   last_run_at: string | null

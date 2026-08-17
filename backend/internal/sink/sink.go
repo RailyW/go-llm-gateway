@@ -57,6 +57,9 @@ type Stats struct {
 	// Active 本实例是否真的承担落库职责。gateway 角色为 false，
 	// 此时上面那些指标都没有意义，前端不该拿它们报警。
 	Active bool `json:"active"`
+	// Via 日志的去处："postgres"（直接落库）/ "redis-stream"（投给 worker）/ ""（丢弃）。
+	// 多实例下这是回答「我的日志去哪了」最直接的一个字段。
+	Via string `json:"via,omitempty"`
 }
 
 // Sink 落库管道。
@@ -71,6 +74,7 @@ type Sink interface {
 // Batch 进程内实现：有界 channel + 单写协程 + 攒批单事务。
 type Batch struct {
 	db *gorm.DB
+	w  *Writer
 
 	ch     chan Entry
 	closed atomic.Bool
@@ -78,9 +82,6 @@ type Batch struct {
 	once   sync.Once
 
 	enqueued, dropped, persisted, batches atomic.Uint64
-
-	// useCopy 是否走 COPY 快路径；Start 时校验列清单，不一致就退化回 GORM
-	useCopy atomic.Bool
 
 	mu           sync.RWMutex
 	lastFlushAt  time.Time
@@ -101,20 +102,12 @@ func NewBatch(db *gorm.DB, queueSize int) *Batch {
 }
 
 func (b *Batch) Start() {
-	// COPY 的列清单是手写的，跟实际表结构校一下；不一致就退化到 GORM（慢但正确），
-	// 而不是默默丢字段。
-	if b.db != nil {
-		if err := VerifyLogColumns(b.db); err != nil {
-			log.Printf("[sink] COPY 不可用，退化为逐行 INSERT（吞吐约降为 1/5）: %v", err)
-		} else {
-			b.useCopy.Store(true)
-		}
-	}
+	b.w = NewWriter(b.db)
 	go b.loop()
 }
 
 // UsingCopy 当前是否走 COPY 快路径（暴露到 WebUI，退化了要能看见）。
-func (b *Batch) UsingCopy() bool { return b.useCopy.Load() }
+func (b *Batch) UsingCopy() bool { return b.w.UsingCopy() }
 
 func (b *Batch) Submit(e Entry) bool {
 	if b.closed.Load() {
@@ -133,8 +126,15 @@ func (b *Batch) Submit(e Entry) bool {
 
 func (b *Batch) loop() {
 	defer close(b.done)
+	collect(b.ch, b.persist)
+}
 
-	interval := b.flushInterval()
+// collect 攒批循环：从 ch 收 Entry，按「条数达标」或「间隔到了」触发 flush。
+//
+// 抽出来给两个生产端共用：Batch（flush = 落 PG）和 Stream（flush = XADD 一批）。
+// 攒批的收益在两边是同一个道理——把 N 次往返压成 1 次。
+func collect(ch <-chan Entry, flushFn func([]Entry)) {
+	interval := currentFlushInterval()
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 
@@ -148,7 +148,7 @@ func (b *Batch) loop() {
 		if len(batch) == 0 {
 			return
 		}
-		b.persist(batch)
+		flushFn(batch)
 		batch = batch[:0]
 	}
 	// resetTimer 按当前配置重置定时器
@@ -159,30 +159,30 @@ func (b *Batch) loop() {
 			default:
 			}
 		}
-		interval = b.flushInterval()
+		interval = currentFlushInterval()
 		timer.Reset(interval)
 	}
 
 	for {
 		select {
-		case e, ok := <-b.ch:
+		case e, ok := <-ch:
 			if !ok {
 				flush()
 				return
 			}
 			batch = append(batch, e)
-			if len(batch) >= b.flushBatch() {
+			if len(batch) >= currentFlushBatch() {
 				flush()
 				resetTimer()
 			}
 		case <-timer.C:
 			flush()
-			interval = b.flushInterval()
+			interval = currentFlushInterval()
 			timer.Reset(interval)
 		case <-watch.C:
 			// 间隔被改小了（比如 60s -> 200ms），立即刷一批并重置，
 			// 别让已经排在队列里的日志继续按旧间隔干等。
-			if b.flushInterval() < interval {
+			if currentFlushInterval() < interval {
 				flush()
 				resetTimer()
 			}
@@ -190,81 +190,28 @@ func (b *Batch) loop() {
 	}
 }
 
-// insertChunk 单条 INSERT 里放多少行（仅 GORM 回退路径用）。
-//
-// PostgreSQL 的协议限制：一条语句最多 65535 个绑定参数。RequestLog 有 ~30 列，
-// 所以每条 INSERT 的行数必须 < 65535/30 ≈ 2184，取 500 留足余量。
-// COPY 走的是流式二进制协议，没有这个限制。
-const insertChunk = 500
-
-// persistViaGORM COPY 不可用时的回退路径（比如列清单校验不通过）。慢，但正确。
-func (b *Batch) persistViaGORM(ctx context.Context, logs []store.RequestLog, gwKeys, chKeys map[uint]struct{}, now time.Time) error {
-	return b.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec("SET LOCAL synchronous_commit = off").Error; err != nil {
-			return err
-		}
-		if len(logs) > 0 {
-			if err := tx.CreateInBatches(logs, insertChunk).Error; err != nil {
-				return err
-			}
-		}
-		if len(gwKeys) > 0 {
-			if err := tx.Model(&store.APIKey{}).Where("id IN ?", ids(gwKeys)).
-				Update("last_used_at", now).Error; err != nil {
-				return err
-			}
-		}
-		if len(chKeys) > 0 {
-			if err := tx.Model(&store.ChannelKey{}).Where("id IN ?", ids(chKeys)).
-				Update("last_used_at", now).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
 // persist 一批日志：单事务 COPY 插入 + 合并 last_used_at UPDATE。
+//
+// 注意这里失败就是**真丢了**：Entry 已经从队列里取出来，没有别的副本。
+// 这是进程内队列的固有性质，也正是 worker + Redis Streams 那条路存在的理由
+// （那边失败可以不 ACK，让消息留在 pending 里重试）。
 func (b *Batch) persist(batch []Entry) {
-	start := time.Now()
-	var errMsg string
-
-	logs := make([]store.RequestLog, 0, len(batch))
-	gwKeys := make(map[uint]struct{}, len(batch))
-	chKeys := make(map[uint]struct{}, len(batch))
-	for i := range batch {
-		if batch[i].Log != nil {
-			logs = append(logs, *batch[i].Log)
-		}
-		if id := batch[i].TouchGatewayKeyID; id > 0 {
-			gwKeys[id] = struct{}{}
-		}
-		if id := batch[i].TouchChannelKeyID; id > 0 {
-			chKeys[id] = struct{}{}
-		}
-	}
-
-	now := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	var err error
-	if b.useCopy.Load() {
-		err = copyLogs(ctx, b.db, logs, ids(gwKeys), ids(chKeys), now)
+	res := b.w.Write(ctx, batch)
+	var errMsg string
+	if res.Err != nil {
+		errMsg = "落库失败: " + res.Err.Error()
+		log.Printf("[sink] %s（本批 %d 条已丢失）", errMsg, len(batch))
 	} else {
-		err = b.persistViaGORM(ctx, logs, gwKeys, chKeys, now)
-	}
-	if err != nil {
-		errMsg = "落库失败: " + err.Error()
-		log.Printf("[sink] %s（本批 %d 条）", errMsg, len(logs))
-	} else {
-		b.persisted.Add(uint64(len(logs)))
+		b.persisted.Add(uint64(res.Logs))
 	}
 	b.batches.Add(1)
 
 	b.mu.Lock()
 	b.lastFlushAt = time.Now()
-	b.lastFlushMs = time.Since(start).Milliseconds()
+	b.lastFlushMs = res.Duration
 	b.lastBatchLen = len(batch)
 	b.lastErr = errMsg
 	b.mu.Unlock()
@@ -280,8 +227,9 @@ func (b *Batch) Stats() Stats {
 		Batches:      b.batches.Load(),
 		QueueLen:     len(b.ch),
 		QueueCap:     cap(b.ch),
-		UsingCopy:    b.useCopy.Load(),
+		UsingCopy:    b.w.UsingCopy(),
 		Active:       true,
+		Via:          "postgres",
 		LastFlushMs:  b.lastFlushMs,
 		LastBatchLen: b.lastBatchLen,
 		LastError:    b.lastErr,
@@ -306,11 +254,12 @@ func (b *Batch) Close(ctx context.Context) error {
 	}
 }
 
-func (b *Batch) flushInterval() time.Duration {
+// 攒批参数每次都从设置里现读：WebUI 改完立刻生效，不用重启。
+func currentFlushInterval() time.Duration {
 	return store.GetSettingDuration(store.KeyLogFlushIntervalMs, time.Millisecond, 200*time.Millisecond)
 }
 
-func (b *Batch) flushBatch() int {
+func currentFlushBatch() int {
 	n := store.GetSettingInt(store.KeyLogFlushBatch, 200)
 	if n < 1 {
 		n = 1
@@ -318,20 +267,13 @@ func (b *Batch) flushBatch() int {
 	return n
 }
 
-func ids(m map[uint]struct{}) []uint {
-	out := make([]uint, 0, len(m))
-	for id := range m {
-		out = append(out, id)
-	}
-	return out
-}
-
-// Discard 不落库的实现，给 gateway 角色用。
+// Discard 不落库也不入队的实现。
 //
-// 注意这是**临时形态**：拆角色的第一步先让 gateway 不直连 PG 写日志，
-// 但日志确实被丢掉了。下一步会换成 Redis Streams 实现（XADD 进队列，worker 消费），
-// 那时 gateway 既不写 PG 也不丢日志。留一个显式的 Discard 而不是 nil，
-// 是为了让「日志去哪了」这件事在代码里有名字、并且能在 Console 上看见。
+// 现在只有一种情况会用到它：**配成 gateway 角色却没配 Redis**。
+// 这是个配置错误（gateway 角色的意义就是横向扩展，而横向扩展必须有 Redis），
+// 但不该因此拒绝启动——转发本身是好的，只是日志没地方去。
+// 留一个有名字的 Discard 而不是 nil，是为了让「日志去哪了」这件事
+// 在代码里有交代、并且能在 Console 上看见丢了多少。
 type Discard struct{ dropped atomic.Uint64 }
 
 func (d *Discard) Submit(Entry) bool {

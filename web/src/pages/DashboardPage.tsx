@@ -62,6 +62,7 @@ export default function DashboardPage() {
   }
 
   const sink = stats?.sink
+  const consumer = stats?.consumer
   const base = location.origin
   const dropRate = sink && sink.enqueued + sink.dropped > 0 ? (sink.dropped / (sink.enqueued + sink.dropped)) * 100 : 0
 
@@ -158,7 +159,7 @@ export default function DashboardPage() {
             {stats?.cluster && stats.cluster.length > 0 && (
               <div className="space-y-2">
                 <div className="text-xs text-muted-foreground">
-                  存活实例（心跳 30 秒过期）。多实例下本页其余指标只反映当前这台，集群情况看这里：
+                  存活实例（心跳 15 秒过期）。多实例下本页其余指标只反映当前这台，集群情况看这里：
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
@@ -166,9 +167,10 @@ export default function DashboardPage() {
                       <tr className="border-b border-border">
                         <th className="py-1.5 text-left font-medium">实例</th>
                         <th className="py-1.5 text-left font-medium">角色</th>
-                        <th className="py-1.5 text-right font-medium">已落库</th>
-                        <th className="py-1.5 text-right font-medium">丢弃日志</th>
-                        <th className="py-1.5 text-right font-medium">快照模型</th>
+                        <th className="py-1.5 text-left font-medium">日志去处</th>
+                        <th className="py-1.5 text-right font-medium">已处理</th>
+                        <th className="py-1.5 text-right font-medium">丢弃</th>
+                        <th className="py-1.5 text-right font-medium">积压</th>
                         <th className="py-1.5 text-right font-medium">心跳</th>
                       </tr>
                     </thead>
@@ -181,17 +183,34 @@ export default function DashboardPage() {
                             <td className="py-1.5">
                               <Badge variant="outline">{p.role}</Badge>
                             </td>
+                            <td className="py-1.5 text-xs text-muted-foreground">
+                              {p.sink?.via === 'redis-stream'
+                                ? 'Redis Stream'
+                                : p.sink?.via === 'postgres'
+                                  ? 'PostgreSQL' + (p.consumer ? ' + 消费 Stream' : '')
+                                  : '不处理'}
+                            </td>
                             <td className="py-1.5 text-right tabular-nums">
-                              {p.sink ? p.sink.persisted.toLocaleString() : '—'}
+                              {p.consumer
+                                ? p.consumer.persisted.toLocaleString()
+                                : p.sink?.active
+                                  ? p.sink.persisted.toLocaleString()
+                                  : '—'}
                             </td>
                             <td
                               className={`py-1.5 text-right tabular-nums ${
-                                (p.logs_dropped ?? 0) > 0 ? 'text-destructive font-medium' : ''
+                                (p.sink?.dropped ?? 0) > 0 ? 'text-destructive font-medium' : ''
                               }`}
                             >
-                              {p.logs_dropped ?? p.sink?.dropped ?? 0}
+                              {p.sink?.dropped ?? 0}
                             </td>
-                            <td className="py-1.5 text-right tabular-nums">{p.registry?.models ?? '—'}</td>
+                            <td
+                              className={`py-1.5 text-right tabular-nums ${
+                                (p.consumer?.backlog ?? 0) > 10000 ? 'text-destructive font-medium' : ''
+                              }`}
+                            >
+                              {p.consumer ? p.consumer.backlog.toLocaleString() : '—'}
+                            </td>
                             <td className="py-1.5 text-right text-muted-foreground">
                               {p.at ? new Date(p.at).toLocaleTimeString() : '—'}
                             </td>
@@ -200,10 +219,16 @@ export default function DashboardPage() {
                     </tbody>
                   </table>
                 </div>
-                {stats.cluster.some((p) => (p.logs_dropped ?? 0) > 0) && (
+                {stats.cluster.some((p) => (p.sink?.dropped ?? 0) > 0) && (
                   <p className="text-xs text-destructive">
-                    有实例在丢日志：gateway 角色目前不直连数据库写日志，而 Redis Streams 队列尚未接入，
-                    因此它转发的请求日志会被丢弃。需要完整日志时请用 role=all 单实例部署。
+                    有实例在丢日志。常见原因：本地缓冲被打满（瞬时流量远超攒批速度），
+                    或 Redis 不可用导致 XADD 失败（fail-open：宁可丢观测数据也不阻塞转发）。
+                  </p>
+                )}
+                {stats.cluster.every((p) => !p.consumer) && stats.cluster.some((p) => p.sink?.via === 'redis-stream') && (
+                  <p className="text-xs text-destructive">
+                    有 gateway 实例在往 Redis Stream 投日志，但集群里没有任何实例在消费（缺 worker/all）。
+                    日志会一直堆到流上限然后被丢弃 —— 请启动一个 <code>GATEWAY_ROLE=worker</code> 实例。
                   </p>
                 )}
               </div>
@@ -212,28 +237,86 @@ export default function DashboardPage() {
         </Card>
       )}
 
-      {sink?.active && (
+      {consumer && (
         <Card>
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              异步落库管道
-              {sink.dropped > 0 ? <Badge variant="destructive">有丢弃</Badge> : <Badge variant="success">健康</Badge>}
-              {sink.using_copy ? (
-                <Badge variant="outline">COPY 快路径</Badge>
-              ) : (
-                <Badge variant="destructive">已退化为逐行 INSERT</Badge>
-              )}
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              日志消费端（Redis Stream → PostgreSQL）
+              {consumer.running ? <Badge variant="success">运行中</Badge> : <Badge variant="destructive">未运行</Badge>}
+              {consumer.backlog > 10000 && <Badge variant="destructive">积压偏高</Badge>}
+              {consumer.failed > 0 && <Badge variant="destructive">有落库失败</Badge>}
+              {consumer.poisoned > 0 && <Badge variant="destructive">有丢弃</Badge>}
             </CardTitle>
             <CardDescription>
-              请求只把一行日志（约 400 字节）丢进队列，后台攒批单事务落库；队列占用与请求体大小无关。
-              队列满会丢<b>日志行</b>（不阻塞转发、不影响原文归档），所以这里必须能看到。
+              从 <code>{consumer.stream_key}</code> 读一批 → 落库成功 → 才 <code>XACK</code>。
+              顺序反过来（先 ACK 再落库）的话，worker 崩溃时那批数据一样会丢，
+              Redis Stream 就退化成一个更慢的进程内队列了。
+              <b>未 ACK 的消息会被 XAUTOCLAIM 接管重试</b>，所以杀 worker 不丢日志。
             </CardDescription>
           </CardHeader>
           <CardContent>
             <div className="grid gap-3 text-sm sm:grid-cols-3 lg:grid-cols-4">
-              <Metric label="队列占用" value={`${sink.queue_len} / ${sink.queue_cap}`} />
+              <Metric label="积压 (lag)" value={consumer.backlog.toLocaleString()} bad={consumer.backlog > 10000} />
+              <Metric label="未确认 (pending)" value={consumer.pending.toLocaleString()} bad={consumer.pending > 5000} />
+              <Metric label="累计消费" value={consumer.consumed.toLocaleString()} />
+              <Metric label="累计落库" value={consumer.persisted.toLocaleString()} />
+              <Metric label="重试接管" value={consumer.retried.toLocaleString()} />
+              <Metric label="毒消息丢弃" value={consumer.poisoned.toLocaleString()} bad={consumer.poisoned > 0} />
+              <Metric label="落库失败批次" value={consumer.failed.toLocaleString()} bad={consumer.failed > 0} />
+              <Metric label="上批 / 耗时" value={`${consumer.last_len} 条 / ${consumer.last_ms}ms`} />
+            </div>
+            {consumer.last_error && <p className="mt-3 text-xs text-destructive">上批错误：{consumer.last_error}</p>}
+            <p className="mt-3 text-xs text-muted-foreground">
+              流物理长度 {consumer.length.toLocaleString()} 条（已回收 {consumer.trimmed.toLocaleString()} 条）。
+              <code>XACK</code> 不删消息，所以已落库的部分会被定期 <code>XTRIM</code> 回收 ——
+              Redis 内存要留给限流计数那类真正需要它的东西。积压看 lag，别看物理长度。
+              {!consumer.using_copy && ' COPY 快路径未启用，落库吞吐约降为 1/5。'}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {sink?.active && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              日志管道
+              {sink.dropped > 0 ? <Badge variant="destructive">有丢弃</Badge> : <Badge variant="success">健康</Badge>}
+              {sink.via === 'redis-stream' ? (
+                <Badge variant="outline">投递到 Redis Stream</Badge>
+              ) : (
+                <Badge variant="outline">直接落库</Badge>
+              )}
+              {sink.via !== 'redis-stream' &&
+                (sink.using_copy ? (
+                  <Badge variant="outline">COPY 快路径</Badge>
+                ) : (
+                  <Badge variant="destructive">已退化为逐行 INSERT</Badge>
+                ))}
+            </CardTitle>
+            <CardDescription>
+              {sink.via === 'redis-stream' ? (
+                <>
+                  请求只把一行日志（约 400 字节）丢进本地缓冲，后台攒批 <code>XADD</code> 进 Redis Stream，
+                  由 worker 实例落库。<b>请求协程不碰网络</b>——直接 XADD 等于把「同步写库」换成「同步写 Redis」，
+                  热路径又多一个能抖动的依赖。
+                </>
+              ) : (
+                <>
+                  请求只把一行日志（约 400 字节）丢进队列，后台攒批单事务落库；队列占用与请求体大小无关。
+                  队列满会丢<b>日志行</b>（不阻塞转发），所以这里必须能看到。
+                </>
+              )}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-3 text-sm sm:grid-cols-3 lg:grid-cols-4">
+              <Metric label="缓冲占用" value={`${sink.queue_len} / ${sink.queue_cap}`} />
               <Metric label="累计入队" value={sink.enqueued.toLocaleString()} />
-              <Metric label="累计落库" value={sink.persisted.toLocaleString()} />
+              <Metric
+                label={sink.via === 'redis-stream' ? '累计投递' : '累计落库'}
+                value={sink.persisted.toLocaleString()}
+              />
               <Metric
                 label="累计丢弃"
                 value={`${sink.dropped.toLocaleString()}${dropRate > 0 ? ` (${dropRate.toFixed(2)}%)` : ''}`}
@@ -248,7 +331,7 @@ export default function DashboardPage() {
               />
             </div>
             {sink.last_error && <p className="mt-3 text-xs text-destructive">上批错误：{sink.last_error}</p>}
-            {!sink.using_copy && (
+            {!sink.using_copy && sink.via !== 'redis-stream' && (
               <p className="mt-3 text-xs text-destructive">
                 COPY 快路径未启用，落库吞吐约降为 1/5。通常是 request_logs 的列与代码里的 COPY
                 列清单不一致（给日志加了字段但没同步 sink/copy.go 的 logColumns），详见服务端日志。
@@ -268,12 +351,26 @@ export default function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              异步落库管道
-              <Badge variant="outline">本实例不落库</Badge>
+              日志管道
+              {sink.dropped > 0 ? (
+                <Badge variant="destructive">日志被丢弃</Badge>
+              ) : (
+                <Badge variant="outline">本实例不处理日志</Badge>
+              )}
             </CardTitle>
             <CardDescription>
-              当前角色（{stats?.instance?.role}）不承担日志落库，队列与 COPY 指标在这里没有意义。
-              落库情况请看上面「集群与协调」里 worker/all 实例那几行。
+              {stats?.instance?.role === 'gateway' ? (
+                <span className="text-destructive">
+                  本实例是 gateway 角色但没有配置 Redis。它不直连数据库写日志（那是解耦的目的），
+                  而没有 Redis 就没有别的去处 —— 转发正常，但请求日志会被丢弃。
+                  请配置 <code>GATEWAY_REDIS_ADDR</code>，或改用 <code>GATEWAY_ROLE=all</code>。
+                </span>
+              ) : (
+                <>
+                  当前角色（{stats?.instance?.role}）不转发流量也不处理日志。
+                  落库情况请看上面「集群与协调」里 worker/all 实例那几行。
+                </>
+              )}
             </CardDescription>
           </CardHeader>
         </Card>

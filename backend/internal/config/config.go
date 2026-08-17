@@ -25,7 +25,12 @@ type Config struct {
 	AdminUser     string // 初始管理员用户名
 	AdminPass     string // 初始管理员密码
 	AllowRegister bool   // 是否允许自助注册
-	LogQueueSize  int    // 异步落库队列容量（满了丢日志行，不阻塞转发）
+	LogQueueSize  int    // 本地日志缓冲容量（满了丢日志行，不阻塞转发）
+	// LogStreamMaxLen Redis Stream 的最大长度。必须有界：Redis 是内存数据库，
+	// worker 挂掉时无界 Stream 会把 Redis 吃光，连带拖垮限流/选主/广播。
+	LogStreamMaxLen int64
+	// LogStreamBatch worker 单次从 Stream 取多少条（决定落库批大小，也就决定吞吐）
+	LogStreamBatch int
 
 	// ---------- Redis（可选，fail-open）----------
 	RedisAddr      string
@@ -58,6 +63,10 @@ func Load() *Config {
 		// 队列里只放日志行（~350 字节/条），所以 32768 条也只有 ~11MB。
 		// 定这个数是为了吞下**突发**：压测里 20000 个请求在 0.9 秒内砸进来。
 		LogQueueSize: envInt("GATEWAY_LOG_QUEUE_SIZE", 32768),
+		// 100 万条 × ~400 字节 ≈ 400MB。按 22000 RPS 算能扛 45 秒完全积压，
+		// 够 worker 重启；再多就该丢，保住 Redis 比保住日志重要。
+		LogStreamMaxLen: int64(envInt("GATEWAY_LOG_STREAM_MAXLEN", 1_000_000)),
+		LogStreamBatch:  envInt("GATEWAY_LOG_STREAM_BATCH", 1000),
 
 		RedisAddr:      env("GATEWAY_REDIS_ADDR", ""),
 		RedisPassword:  env("GATEWAY_REDIS_PASSWORD", ""),

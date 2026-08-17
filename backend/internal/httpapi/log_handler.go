@@ -164,7 +164,11 @@ func (s *Server) stats(c *gin.Context) {
 		if s.cleaner != nil {
 			out["cleaner"] = s.cleaner.Status()
 		}
-		out["sink"] = s.sink.Stats()    // 异步落库管道健康度（丢弃必须可见）
+		out["sink"] = s.sink.Stats() // 异步落库管道健康度（丢弃必须可见）
+		if s.consumer != nil {
+			// Stream 消费端：积压是这条链路唯一的慢性病信号
+			out["consumer"] = s.consumer.Stats()
+		}
 		out["registry"] = s.reg.Stats() // 配置快照状态
 		// 多实例相关：角色、Redis 健康度、降级情况、广播与选主。
 		// fail-open 最大的风险是「静默裸奔」，所以降级必须在这里看得见。
