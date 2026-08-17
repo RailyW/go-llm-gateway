@@ -122,7 +122,8 @@ export default function DashboardPage() {
               {sink.dropped > 0 ? <Badge variant="destructive">有丢弃</Badge> : <Badge variant="success">健康</Badge>}
             </CardTitle>
             <CardDescription>
-              日志与原文归档不在请求路径上写：请求只入队，后台攒批单事务落库。队列满会丢日志（不阻塞转发），所以这里必须能看到。
+              请求只把一行日志（约 400 字节）丢进队列，后台攒批单事务落库；队列占用与请求体大小无关。
+              队列满会丢<b>日志行</b>（不阻塞转发、不影响原文归档），所以这里必须能看到。
             </CardDescription>
           </CardHeader>
           <CardContent>

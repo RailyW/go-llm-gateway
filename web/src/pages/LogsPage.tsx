@@ -57,7 +57,7 @@ export default function LogsPage() {
       <div className="flex items-end justify-between">
         <div>
           <h1 className="text-xl font-semibold">日志</h1>
-          <p className="text-sm text-muted-foreground">共 {total} 条 · 点「原文」查看本地归档的请求/响应全文</p>
+          <p className="text-sm text-muted-foreground">共 {total} 条 · 点「原文」查看本地归档的请求/响应全文（需在设置页开启「归档请求/响应原文」）</p>
         </div>
         <Button variant="outline" onClick={load} disabled={loading}>
           <RefreshCw className={loading ? 'size-4 animate-spin' : 'size-4'} /> 刷新

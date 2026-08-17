@@ -22,6 +22,7 @@ const (
 	KeyUpstreamTimeoutSecond = "upstream_timeout_seconds" // 上游超时（流式不受限）
 	KeyLogFlushIntervalMs    = "log_flush_interval_ms"    // 异步落库：攒批时间窗
 	KeyLogFlushBatch         = "log_flush_batch"          // 异步落库：单批最大条数
+	KeyArchiveEnabled        = "archive_enabled"          // 是否归档请求/响应原文（默认关）
 )
 
 var defaults = map[string]string{
@@ -35,6 +36,9 @@ var defaults = map[string]string{
 	KeyUpstreamTimeoutSecond: "300",
 	KeyLogFlushIntervalMs:    "200",
 	KeyLogFlushBatch:         "200",
+	// 默认关：原文是增长最快的部分，只在排查问题时才需要，
+	// 不该默认就把每个请求的完整 body 写上磁盘。
+	KeyArchiveEnabled: "false",
 }
 
 var (

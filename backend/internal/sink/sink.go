@@ -1,4 +1,4 @@
-// Package sink 把「日志落库 + 原文归档」从请求热路径上摘下来。
+// Package sink 把**日志落库**从请求热路径上摘下来。
 //
 // 为什么需要它：原先每个请求同步做 1 条日志 INSERT + 2 条 last_used_at UPDATE，
 // 也就是 3 个写事务；每个事务都要等一次 WAL 落盘确认 + 一次网络往返。
@@ -11,6 +11,10 @@
 // 换到 PostgreSQL 后攒批依然是净收益，只是收益来源变了：
 // 不再是「绕开单写者」，而是更少的事务提交、更少的 WAL flush、更少的网络往返。
 //
+// 队列里**只有日志行**（~400 字节/条，所以 8192 深的队列就是 ~3MB，与请求大小无关）。
+// 请求/响应原文由 archive 包在请求协程里当场写盘——它们动辄几十 KB，
+// 放进队列会让内存占用变成「队列深度 × 请求体大小」，而且攒批对写文件没任何好处。
+//
 // Sink 是接口：将来要多实例部署、或要把日志交给独立消费者写 ClickHouse，
 // 换一个 Redis Stream 实现即可，请求侧代码不用动。
 package sink
@@ -22,15 +26,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RailyW/go-llm-gateway/backend/internal/archive"
 	"github.com/RailyW/go-llm-gateway/backend/internal/store"
 	"gorm.io/gorm"
 )
 
-// Entry 一次请求产生的全部待持久化内容。
+// Entry 一次请求产生的待落库内容。它必须保持**小且定长**（~400 字节）：
+// 排队中的 Entry 占的是堆内存，任何跟请求体积相关的东西（原文！）都不能放进来。
 type Entry struct {
-	Log   *store.RequestLog
-	Files []archive.File // 待写的归档文件（流式响应文件已在请求协程增量写完，不在这里）
+	Log *store.RequestLog
 
 	// 需要刷新 last_used_at 的 key（合并成每批 1 条 UPDATE）
 	TouchGatewayKeyID uint
@@ -62,8 +65,7 @@ type Sink interface {
 
 // Batch 进程内实现：有界 channel + 单写协程 + 攒批单事务。
 type Batch struct {
-	db       *gorm.DB
-	archiver *archive.Archiver
+	db *gorm.DB
 
 	ch     chan Entry
 	closed atomic.Bool
@@ -79,15 +81,14 @@ type Batch struct {
 	lastErr      string
 }
 
-func NewBatch(db *gorm.DB, archiver *archive.Archiver, queueSize int) *Batch {
+func NewBatch(db *gorm.DB, queueSize int) *Batch {
 	if queueSize <= 0 {
 		queueSize = 4096
 	}
 	return &Batch{
-		db:       db,
-		archiver: archiver,
-		ch:       make(chan Entry, queueSize),
-		done:     make(chan struct{}),
+		db:   db,
+		ch:   make(chan Entry, queueSize),
+		done: make(chan struct{}),
 	}
 }
 
@@ -117,6 +118,11 @@ func (b *Batch) loop() {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 
+	// 守望定时器：只用来发现「设置页把攒批间隔改小了」。
+	// 没有它的话，把间隔从 60s 改回 200ms 得等那 60s 走完才生效（实测到的 bug）。
+	watch := time.NewTicker(time.Second)
+	defer watch.Stop()
+
 	batch := make([]Entry, 0, 256)
 	flush := func() {
 		if len(batch) == 0 {
@@ -124,6 +130,17 @@ func (b *Batch) loop() {
 		}
 		b.persist(batch)
 		batch = batch[:0]
+	}
+	// resetTimer 按当前配置重置定时器
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		interval = b.flushInterval()
+		timer.Reset(interval)
 	}
 
 	for {
@@ -136,20 +153,19 @@ func (b *Batch) loop() {
 			batch = append(batch, e)
 			if len(batch) >= b.flushBatch() {
 				flush()
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(b.flushInterval())
+				resetTimer()
 			}
 		case <-timer.C:
 			flush()
-			if n := b.flushInterval(); n != interval {
-				interval = n // 设置页改了刷新间隔，下一轮生效
-			}
+			interval = b.flushInterval()
 			timer.Reset(interval)
+		case <-watch.C:
+			// 间隔被改小了（比如 60s -> 200ms），立即刷一批并重置，
+			// 别让已经排在队列里的日志继续按旧间隔干等。
+			if b.flushInterval() < interval {
+				flush()
+				resetTimer()
+			}
 		}
 	}
 }
@@ -161,19 +177,15 @@ func (b *Batch) loop() {
 // 是两件事——攒批决定事务多大，这里决定事务内切成几条语句，取 500 留足余量。
 const insertChunk = 500
 
-// persist 一批数据：先写归档文件，再在单事务里批量插入日志 + 合并 UPDATE。
-//
-// 顺序很重要：文件先落盘、日志行后入库，保证「日志里能看到的请求，原文一定已存在」。
+// persist 一批日志：单事务批量插入 + 合并 last_used_at UPDATE。
 func (b *Batch) persist(batch []Entry) {
 	start := time.Now()
 	var errMsg string
 
-	files := make([]archive.File, 0, len(batch)*2)
 	logs := make([]store.RequestLog, 0, len(batch))
 	gwKeys := make(map[uint]struct{}, len(batch))
 	chKeys := make(map[uint]struct{}, len(batch))
 	for i := range batch {
-		files = append(files, batch[i].Files...)
 		if batch[i].Log != nil {
 			logs = append(logs, *batch[i].Log)
 		}
@@ -182,13 +194,6 @@ func (b *Batch) persist(batch []Entry) {
 		}
 		if id := batch[i].TouchChannelKeyID; id > 0 {
 			chKeys[id] = struct{}{}
-		}
-	}
-
-	if len(files) > 0 {
-		if err := b.archiver.WriteFiles(files); err != nil {
-			errMsg = "写归档失败: " + err.Error()
-			log.Printf("[sink] %s", errMsg)
 		}
 	}
 

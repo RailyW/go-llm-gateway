@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -71,17 +72,22 @@ func NewService(reg *registry.Registry, sk sink.Sink, archiver *archive.Archiver
 	}
 }
 
-// call 一次转发的可变状态：日志行 + 待归档文件，最后一次性交给 sink。
+// call 一次转发的可变状态。
+//
+// 注意这里**不再持有原文字节**：归档在请求协程里当场写盘，
+// 交给 sink 的只有 ~400 字节的日志行。早期版本把原文也塞进队列，
+// 于是队列内存取决于请求体大小——每条 64KB 原文 × 8192 深 = 1GB。
 type call struct {
 	proto   Protocol
 	rec     *store.RequestLog
 	meta    *archive.RequestMeta
 	dateDir string
-	// 非流式响应体（流式响应是增量写文件的，不留在内存）
-	respBody []byte
-	// 流式响应已经落好文件，无需再交给 sink
-	respOnDisk bool
-	submitted  bool
+	// archiving 本次是否归档原文（设置页开关，默认关）；
+	// 请求开始时读一次并固定住，避免一次请求中途改配置导致只写了一半
+	archiving bool
+	// respFile 响应归档文件（流式与非流式都用它，边收边写）
+	respFile  *archive.ResponseFile
+	submitted bool
 }
 
 // Handle 处理某个协议端点的一次转发。整个流程与具体协议无关：
@@ -92,8 +98,9 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 	dateDir := s.archiver.DateDir(start)
 
 	c := &call{
-		proto:   p,
-		dateDir: dateDir,
+		proto:     p,
+		dateDir:   dateDir,
+		archiving: store.GetSettingBool(store.KeyArchiveEnabled, false),
 		rec: &store.RequestLog{
 			ID:          reqID,
 			Protocol:    p.Name(),
@@ -140,7 +147,6 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 		s.fail(w, c, http.StatusBadRequest, "缺少 model 字段")
 		return
 	}
-
 	binding, upKey, err := s.pick(model, p.Name(), actor)
 	if err != nil {
 		s.fail(w, c, http.StatusNotFound, err.Error())
@@ -176,6 +182,9 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 		return
 	}
 	c.meta.UpstreamURL = upReq.URL.String()
+	// 请求归档在这里写：已经拿到全部元信息（含上游 URL），
+	// 且就算上游调用失败也能留下现场。写完立刻释放 body 引用。
+	s.archiveRequest(c)
 
 	resp, err := s.client.Do(upReq)
 	if err != nil {
@@ -216,7 +225,12 @@ func (s *Service) pipeBody(w http.ResponseWriter, resp *http.Response, c *call, 
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(raw)
 
-	c.respBody = raw
+	// 归档写在回吐响应**之后**：不抬高客户端看到的首字节延迟。
+	if c.archiving {
+		if err := s.archiver.WriteResponse(c.dateDir, c.rec.ID, resp.StatusCode, raw); err != nil {
+			log.Printf("[archive] 写响应归档失败 %s: %v", c.rec.ID, err)
+		}
+	}
 	c.rec.DurationMs = time.Since(start).Milliseconds()
 }
 
@@ -233,11 +247,11 @@ func (s *Service) pipeStream(w http.ResponseWriter, resp *http.Response, c *call
 	w.WriteHeader(resp.StatusCode)
 	c.rec.StatusCode = resp.StatusCode
 
-	archiveFile, err := s.archiver.OpenResponse(c.dateDir, c.rec.ID, resp.StatusCode)
-	if err == nil {
-		c.respOnDisk = true
-		defer archiveFile.Close()
+	archiveFile, err := s.openResponseArchive(c, resp.StatusCode)
+	if err != nil {
+		log.Printf("[archive] 打开响应归档失败 %s: %v", c.rec.ID, err)
 	}
+	defer archiveFile.Close()
 
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReaderSize(resp.Body, 64<<10)
@@ -329,7 +343,7 @@ func (s *Service) pick(modelName, protocol string, actor Actor) (*store.Binding,
 	return b, k, nil
 }
 
-// fail 用当前协议的错误格式返回。日志与归档仍由 defer 里的 submit 统一处理。
+// fail 用当前协议的错误格式返回。日志仍由 defer 里的 submit 统一处理。
 func (s *Service) fail(w http.ResponseWriter, c *call, status int, msg string) {
 	c.rec.StatusCode = status
 	c.rec.ErrorMessage = truncate(msg, 1000)
@@ -337,30 +351,56 @@ func (s *Service) fail(w http.ResponseWriter, c *call, status int, msg string) {
 		c.rec.DurationMs = time.Since(c.rec.CreatedAt).Milliseconds()
 	}
 	payload := c.proto.ErrorBody(status, msg, c.rec.ID)
-	c.respBody = payload
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Gateway-Request-Id", c.rec.ID)
 	w.WriteHeader(status)
 	_, _ = w.Write(payload)
+
+	// 失败也要留下现场：请求归档可能还没写（比如选不到上游就失败了），补上。
+	if c.archiving {
+		s.archiveRequest(c)
+		if err := s.archiver.WriteResponse(c.dateDir, c.rec.ID, status, payload); err != nil {
+			log.Printf("[archive] 写错误归档失败 %s: %v", c.rec.ID, err)
+		}
+	}
 }
 
-// submit 把日志行 + 归档文件一次性丢进异步管道；队列满则丢弃（有计数，WebUI 可见）。
+// archiveRequest 写请求原文（幂等：写过就不再写，并释放 body 引用）。
+func (s *Service) archiveRequest(c *call) {
+	if !c.archiving || c.meta == nil {
+		return
+	}
+	if err := s.archiver.WriteRequest(c.dateDir, c.rec.ID, c.meta); err != nil {
+		log.Printf("[archive] 写请求归档失败 %s: %v", c.rec.ID, err)
+	}
+	// 写完就丢掉引用，别让 body 跟着请求生命周期多活一会
+	c.meta = nil
+}
+
+// openResponseArchive 关闭归档时返回 nil（*ResponseFile 的方法对 nil 安全，写入直接丢弃）。
+func (s *Service) openResponseArchive(c *call, status int) (*archive.ResponseFile, error) {
+	if !c.archiving {
+		return nil, nil
+	}
+	f, err := s.archiver.OpenResponse(c.dateDir, c.rec.ID, status)
+	if err != nil {
+		return nil, err
+	}
+	c.respFile = f
+	return f, nil
+}
+
+// submit 只把**日志行**丢进异步管道（~400 字节）；原文已经当场写完了。
+// 队列满则丢弃该日志行（有计数，WebUI 可见），但原文不会跟着丢。
 func (s *Service) submit(c *call) {
 	if c.submitted {
 		return
 	}
 	c.submitted = true
 
-	files := make([]archive.File, 0, 2)
-	files = append(files, archive.MarshalRequest(c.dateDir, c.rec.ID, c.meta))
-	if !c.respOnDisk {
-		files = append(files, archive.MarshalResponse(c.dateDir, c.rec.ID, c.rec.StatusCode, c.respBody))
-	}
-
 	s.sink.Submit(sink.Entry{
 		Log:               c.rec,
-		Files:             files,
 		TouchGatewayKeyID: c.rec.APIKeyID,
 		TouchChannelKeyID: c.rec.ChannelKeyID,
 	})

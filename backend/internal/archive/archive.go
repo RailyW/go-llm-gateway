@@ -4,6 +4,15 @@
 //
 //	<root>/2024-05-01/<request-id>.request.json
 //	<root>/2024-05-01/<request-id>.response.txt
+//
+// 归档默认**关闭**（设置页可开）。它是增长最快的部分，多数时候只在
+// 排查问题时才需要，不应该默认就往盘上写每一个请求的全文。
+//
+// 写入时机：**在请求协程里当场写**，不进异步队列。
+// 原因是原文体积大（请求体上限 20MB），放进队列等于把它们攒在堆上：
+// 8192 深的队列、每条 64KB 原文就是 1GB 堆内存。而写文件本身只有 ~20µs
+// （写进 page cache，不 fsync），相比动辄几秒的 LLM 调用可忽略不计。
+// 攒批只对数据库写入有意义（减事务/减 fsync），对写文件没有任何收益。
 package archive
 
 import (
@@ -59,14 +68,24 @@ type RequestMeta struct {
 	Body           json.RawMessage   `json:"body"`
 }
 
-// File 一个待写入的归档文件（由 sink 在后台批量写）。
+// File 一个待写入的归档文件。
 type File struct {
 	DateDir string
 	Name    string
 	Data    []byte
 }
 
-// MarshalRequest 把请求元信息序列化成待写文件（在请求协程里做，只是 CPU）。
+// WriteRequest 把请求元信息当场序列化并写盘。
+func (a *Archiver) WriteRequest(dateDir, id string, meta *RequestMeta) error {
+	return a.writeFile(MarshalRequest(dateDir, id, meta))
+}
+
+// WriteResponse 非流式响应：body 已经在内存里，直接写盘。
+func (a *Archiver) WriteResponse(dateDir, id string, status int, body []byte) error {
+	return a.writeFile(MarshalResponse(dateDir, id, status, body))
+}
+
+// MarshalRequest 把请求元信息序列化成待写文件。
 func MarshalRequest(dateDir, id string, meta *RequestMeta) File {
 	if !json.Valid(meta.Body) {
 		meta.Body = mustJSONString(string(meta.Body))
@@ -92,22 +111,23 @@ func MarshalResponse(dateDir, id string, status int, body []byte) File {
 	return File{DateDir: dateDir, Name: ResponseFileName(id), Data: buf}
 }
 
-// WriteFiles 批量写入（sink 后台协程调用）。
+// WriteFiles 批量写入。
 func (a *Archiver) WriteFiles(files []File) error {
 	var firstErr error
 	for _, f := range files {
-		dir, err := a.ensureDir(f.DateDir)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if err := os.WriteFile(filepath.Join(dir, f.Name), f.Data, 0o644); err != nil && firstErr == nil {
+		if err := a.writeFile(f); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+func (a *Archiver) writeFile(f File) error {
+	dir, err := a.ensureDir(f.DateDir)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, f.Name), f.Data, 0o644)
 }
 
 // ResponseFile 流式响应的增量写入器：边转发边追加，内存占用只有一个 bufio 缓冲。
@@ -169,7 +189,7 @@ func (a *Archiver) Read(dateDir, id string) (request string, response string, er
 	reqB, reqErr := os.ReadFile(filepath.Join(dir, RequestFileName(id)))
 	respB, respErr := os.ReadFile(filepath.Join(dir, ResponseFileName(id)))
 	if reqErr != nil && respErr != nil {
-		return "", "", fmt.Errorf("archive not found（可能已被清理服务删除，或仍在异步写入队列中）")
+		return "", "", fmt.Errorf("没有找到原文归档：可能未开启归档（设置页「归档请求/响应原文」，默认关闭），或已被清理服务删除")
 	}
 	return string(reqB), string(respB), nil
 }

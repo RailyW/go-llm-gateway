@@ -49,7 +49,7 @@ func main() {
 	}
 
 	// 异步落库管道：日志与归档都不在请求路径上写
-	logSink := sink.NewBatch(db, archiver, cfg.LogQueueSize)
+	logSink := sink.NewBatch(db, cfg.LogQueueSize)
 	logSink.Start()
 
 	relaySvc := relay.NewService(reg, logSink, archiver)
@@ -70,7 +70,8 @@ func main() {
 		log.Printf("[boot] 监听 http://localhost:%s  (数据目录 %s, 前端内嵌=%v)", cfg.Port, cfg.DataDir, webassets.Built())
 		log.Printf("[boot] 数据库 %s (连接池 %d/%d)", config.SafeDSN(cfg.DSN), cfg.DBMaxIdle, cfg.DBMaxOpen)
 		log.Printf("[boot] 网关端点 POST http://localhost:%s/v1/chat/completions | /v1/responses | /v1/messages", cfg.Port)
-		log.Printf("[boot] 异步落库队列容量 %d", cfg.LogQueueSize)
+		log.Printf("[boot] 异步落库队列容量 %d 条（只放日志行，~400 字节/条）；原文归档=%v",
+			cfg.LogQueueSize, store.GetSettingBool(store.KeyArchiveEnabled, false))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("服务启动失败: %v", err)
 		}

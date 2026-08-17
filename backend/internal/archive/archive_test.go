@@ -65,18 +65,18 @@ func TestResponseFileCap(t *testing.T) {
 	}
 }
 
-func TestMarshalAndWriteFiles(t *testing.T) {
+// 请求协程当场写盘（不再经过异步队列）
+func TestWriteRequestAndResponse(t *testing.T) {
 	root := t.TempDir()
 	a := NewArchiver(root)
 	dir := a.DateDir(time.Now())
 
 	meta := &RequestMeta{RequestID: "req-3", Time: time.Now(), Protocol: "openai-chat", Username: "u", GroupName: "g"}
 	meta.Body = []byte(`{"model":"m"}`)
-	files := []File{
-		MarshalRequest(dir, "req-3", meta),
-		MarshalResponse(dir, "req-3", 200, []byte(`{"ok":true}`)),
+	if err := a.WriteRequest(dir, "req-3", meta); err != nil {
+		t.Fatal(err)
 	}
-	if err := a.WriteFiles(files); err != nil {
+	if err := a.WriteResponse(dir, "req-3", 200, []byte(`{"ok":true}`)); err != nil {
 		t.Fatal(err)
 	}
 	req, resp, err := a.Read(dir, "req-3")
@@ -126,5 +126,17 @@ func TestCleanup(t *testing.T) {
 	}
 	if r, _ := a.Cleanup(0); r != nil {
 		t.Error("保留天数 0 表示不清理")
+	}
+}
+
+// 关闭归档时 ResponseFile 为 nil，写入必须安全丢弃（relay 里靠这个省掉分支）
+func TestNilResponseFile(t *testing.T) {
+	var rf *ResponseFile
+	n, err := rf.Write([]byte("data: hello\n"))
+	if err != nil || n != 12 {
+		t.Errorf("nil 写入应静默成功: n=%d err=%v", n, err)
+	}
+	if err := rf.Close(); err != nil {
+		t.Errorf("nil Close 应返回 nil: %v", err)
 	}
 }
