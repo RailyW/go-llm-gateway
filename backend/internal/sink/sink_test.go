@@ -2,6 +2,7 @@ package sink
 
 import (
 	"context"
+	"encoding/json"
 	"runtime"
 	"testing"
 	"time"
@@ -227,4 +228,134 @@ func TestShrinkFlushIntervalTakesEffect(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Errorf("改小攒批间隔后 3 秒内应落库完，实际只落了 %d/10 条", s.Stats().Persisted)
+}
+
+// COPY 快路径必须真的启用（不启用意味着悄悄退化成 1/5 的吞吐）
+func TestCopyPathEnabled(t *testing.T) {
+	db := setup(t)
+	if err := VerifyLogColumns(db); err != nil {
+		t.Fatalf("COPY 列清单与表结构不一致（给 RequestLog 加字段后要同步 logColumns）: %v", err)
+	}
+	s := NewBatch(db, 64)
+	s.Start()
+	defer s.Close(context.Background())
+	if !s.UsingCopy() {
+		t.Error("Start 后应启用 COPY 快路径")
+	}
+	if !s.Stats().UsingCopy {
+		t.Error("Stats 要把 COPY 状态暴露出去，退化了得能看见")
+	}
+}
+
+// COPY 写进去的字段要完整（列顺序错位会静默写错列，这个测试就是防它）
+func TestCopyWritesAllFields(t *testing.T) {
+	db := setup(t)
+	_ = store.SetSettings(map[string]string{store.KeyLogFlushIntervalMs: "20", store.KeyLogFlushBatch: "10"})
+
+	s := NewBatch(db, 64)
+	s.Start()
+	if !s.UsingCopy() {
+		t.Fatal("需要 COPY 路径")
+	}
+
+	want := store.RequestLog{
+		ID: "copy-full-1", Protocol: "anthropic-messages", Endpoint: "/v1/messages",
+		UserID: 7, Username: "bob", GroupID: 3, GroupName: "客服组",
+		APIKeyID: 11, APIKeyName: "cs-key", ModelName: "claude", ChannelID: 2,
+		ChannelName: "ant-main", UpstreamModel: "claude-3-5", ChannelKeyID: 9, ChannelKeyName: "ck-2",
+		Stream: true, StatusCode: 429, PromptTokens: 100, CompletionTokens: 200, TotalTokens: 300,
+		DurationMs: 4567, ClientIP: "10.1.2.3", ErrorMessage: "rate limited",
+		ArchivePath: "2026-08-17", CreatedAt: time.Now(),
+		Usage: store.JSONB(`{"input_tokens":100,"cache_read_input_tokens":42}`),
+	}
+	s.Submit(Entry{Log: &want})
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var got store.RequestLog
+	if err := db.First(&got, "id = ?", want.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"Protocol", got.Protocol, want.Protocol},
+		{"Endpoint", got.Endpoint, want.Endpoint},
+		{"UserID", got.UserID, want.UserID},
+		{"Username", got.Username, want.Username},
+		{"GroupID", got.GroupID, want.GroupID},
+		{"GroupName", got.GroupName, want.GroupName},
+		{"APIKeyID", got.APIKeyID, want.APIKeyID},
+		{"APIKeyName", got.APIKeyName, want.APIKeyName},
+		{"ModelName", got.ModelName, want.ModelName},
+		{"ChannelID", got.ChannelID, want.ChannelID},
+		{"ChannelName", got.ChannelName, want.ChannelName},
+		{"UpstreamModel", got.UpstreamModel, want.UpstreamModel},
+		{"ChannelKeyID", got.ChannelKeyID, want.ChannelKeyID},
+		{"ChannelKeyName", got.ChannelKeyName, want.ChannelKeyName},
+		{"Stream", got.Stream, want.Stream},
+		{"StatusCode", got.StatusCode, want.StatusCode},
+		{"PromptTokens", got.PromptTokens, want.PromptTokens},
+		{"CompletionTokens", got.CompletionTokens, want.CompletionTokens},
+		{"TotalTokens", got.TotalTokens, want.TotalTokens},
+		{"DurationMs", got.DurationMs, want.DurationMs},
+		{"ClientIP", got.ClientIP, want.ClientIP},
+		{"ErrorMessage", got.ErrorMessage, want.ErrorMessage},
+		{"ArchivePath", got.ArchivePath, want.ArchivePath},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v（检查 logColumns 与 logRow 的顺序是否一致）", c.name, c.got, c.want)
+		}
+	}
+	if got.CreatedAt.Unix() != want.CreatedAt.Unix() {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, want.CreatedAt)
+	}
+	var usage map[string]int
+	if err := json.Unmarshal(got.Usage, &usage); err != nil {
+		t.Fatalf("usage jsonb 坏了: %v (%s)", err, got.Usage)
+	}
+	if usage["cache_read_input_tokens"] != 42 {
+		t.Errorf("usage = %v", usage)
+	}
+}
+
+// usage 为空时要写 NULL（空串不是合法 jsonb，会让整批 COPY 失败）
+func TestCopyNullUsage(t *testing.T) {
+	db := setup(t)
+	_ = store.SetSettings(map[string]string{store.KeyLogFlushIntervalMs: "20", store.KeyLogFlushBatch: "10"})
+	s := NewBatch(db, 64)
+	s.Start()
+	s.Submit(Entry{Log: &store.RequestLog{ID: "copy-null-usage", StatusCode: 200, CreatedAt: time.Now()}})
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); st.Persisted != 1 || st.LastError != "" {
+		t.Errorf("usage 为空也应正常落库: %+v", st)
+	}
+}
+
+// 模拟「给表加了列但忘了更新 logColumns」，校验必须报错
+func TestColumnDriftDetected(t *testing.T) {
+	db := setup(t)
+	if err := VerifyLogColumns(db); err != nil {
+		t.Fatalf("基线应通过: %v", err)
+	}
+	if err := db.Exec("ALTER TABLE request_logs ADD COLUMN new_field text").Error; err != nil {
+		t.Fatal(err)
+	}
+	err := VerifyLogColumns(db)
+	if err == nil {
+		t.Fatal("表多出列时必须报错，否则新字段会静默不落库")
+	}
+	t.Logf("正确检出: %v", err)
+
+	// 退化路径要能正常工作
+	b := NewBatch(db, 16)
+	b.Start()
+	if b.UsingCopy() {
+		t.Error("列不一致时不该启用 COPY")
+	}
 }

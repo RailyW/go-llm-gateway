@@ -108,6 +108,7 @@ export interface SinkStats {
   last_flush_ms: number
   last_batch_len: number
   last_error: string
+  using_copy: boolean
 }
 export interface RegistryStats {
   built_at: string
@@ -138,6 +139,7 @@ export interface CleanerStatus {
   last_removed_archive_dirs: number
   last_removed_log_rows: number
   last_error: string
+  using_copy: boolean
   running: boolean
 }
 

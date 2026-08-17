@@ -23,7 +23,7 @@ type Config struct {
 	AdminUser     string // 初始管理员用户名
 	AdminPass     string // 初始管理员密码
 	AllowRegister bool   // 是否允许自助注册
-	LogQueueSize  int    // 异步落库队列容量（满了丢日志，不阻塞转发）
+	LogQueueSize  int    // 异步落库队列容量（满了丢日志行，不阻塞转发）
 }
 
 func Load() *Config {
@@ -41,7 +41,10 @@ func Load() *Config {
 		AdminUser:     env("GATEWAY_ADMIN_USER", "admin"),
 		AdminPass:     env("GATEWAY_ADMIN_PASS", "admin"),
 		AllowRegister: envBool("GATEWAY_ALLOW_REGISTER", true),
-		LogQueueSize:  envInt("GATEWAY_LOG_QUEUE_SIZE", 8192),
+		// 队列里只放日志行（~350 字节/条），所以 32768 条也只有 ~11MB。
+		// 定这个数是为了吞下**突发**：压测里 20000 个请求在 0.9 秒内砸进来，
+		// 8192 的队列装不下（那是当初按「每条 Entry 很大」拍的，摘掉原文后明显偏小）。
+		LogQueueSize: envInt("GATEWAY_LOG_QUEUE_SIZE", 32768),
 	}
 	return c
 }

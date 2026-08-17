@@ -120,6 +120,11 @@ export default function DashboardPage() {
             <CardTitle className="flex items-center gap-2">
               异步落库管道
               {sink.dropped > 0 ? <Badge variant="destructive">有丢弃</Badge> : <Badge variant="success">健康</Badge>}
+              {sink.using_copy ? (
+                <Badge variant="outline">COPY 快路径</Badge>
+              ) : (
+                <Badge variant="destructive">已退化为逐行 INSERT</Badge>
+              )}
             </CardTitle>
             <CardDescription>
               请求只把一行日志（约 400 字节）丢进队列，后台攒批单事务落库；队列占用与请求体大小无关。
@@ -145,6 +150,12 @@ export default function DashboardPage() {
               />
             </div>
             {sink.last_error && <p className="mt-3 text-xs text-destructive">上批错误：{sink.last_error}</p>}
+            {!sink.using_copy && (
+              <p className="mt-3 text-xs text-destructive">
+                COPY 快路径未启用，落库吞吐约降为 1/5。通常是 request_logs 的列与代码里的 COPY
+                列清单不一致（给日志加了字段但没同步 sink/copy.go 的 logColumns），详见服务端日志。
+              </p>
+            )}
             {stats?.registry && (
               <p className="mt-3 text-xs text-muted-foreground">
                 配置快照：{stats.registry.models} 个模型 / {stats.registry.callers} 个网关 key / {stats.registry.key_sets}{' '}

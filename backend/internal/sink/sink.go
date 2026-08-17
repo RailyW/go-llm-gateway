@@ -52,6 +52,8 @@ type Stats struct {
 	LastFlushMs  int64  `json:"last_flush_ms"`
 	LastBatchLen int    `json:"last_batch_len"`
 	LastError    string `json:"last_error"`
+	// UsingCopy 是否在用 COPY 快路径（false = 已退化到逐行 INSERT，吞吐约 1/5）
+	UsingCopy bool `json:"using_copy"`
 }
 
 // Sink 落库管道。
@@ -74,6 +76,9 @@ type Batch struct {
 
 	enqueued, dropped, persisted, batches atomic.Uint64
 
+	// useCopy 是否走 COPY 快路径；Start 时校验列清单，不一致就退化回 GORM
+	useCopy atomic.Bool
+
 	mu           sync.RWMutex
 	lastFlushAt  time.Time
 	lastFlushMs  int64
@@ -93,8 +98,20 @@ func NewBatch(db *gorm.DB, queueSize int) *Batch {
 }
 
 func (b *Batch) Start() {
+	// COPY 的列清单是手写的，跟实际表结构校一下；不一致就退化到 GORM（慢但正确），
+	// 而不是默默丢字段。
+	if b.db != nil {
+		if err := VerifyLogColumns(b.db); err != nil {
+			log.Printf("[sink] COPY 不可用，退化为逐行 INSERT（吞吐约降为 1/5）: %v", err)
+		} else {
+			b.useCopy.Store(true)
+		}
+	}
 	go b.loop()
 }
+
+// UsingCopy 当前是否走 COPY 快路径（暴露到 WebUI，退化了要能看见）。
+func (b *Batch) UsingCopy() bool { return b.useCopy.Load() }
 
 func (b *Batch) Submit(e Entry) bool {
 	if b.closed.Load() {
@@ -170,14 +187,41 @@ func (b *Batch) loop() {
 	}
 }
 
-// insertChunk 单条 INSERT 里放多少行。
+// insertChunk 单条 INSERT 里放多少行（仅 GORM 回退路径用）。
 //
 // PostgreSQL 的协议限制：一条语句最多 65535 个绑定参数。RequestLog 有 ~30 列，
-// 所以每条 INSERT 的行数必须 < 65535/30 ≈ 2184。这跟用户可调的「攒批条数」
-// 是两件事——攒批决定事务多大，这里决定事务内切成几条语句，取 500 留足余量。
+// 所以每条 INSERT 的行数必须 < 65535/30 ≈ 2184，取 500 留足余量。
+// COPY 走的是流式二进制协议，没有这个限制。
 const insertChunk = 500
 
-// persist 一批日志：单事务批量插入 + 合并 last_used_at UPDATE。
+// persistViaGORM COPY 不可用时的回退路径（比如列清单校验不通过）。慢，但正确。
+func (b *Batch) persistViaGORM(ctx context.Context, logs []store.RequestLog, gwKeys, chKeys map[uint]struct{}, now time.Time) error {
+	return b.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SET LOCAL synchronous_commit = off").Error; err != nil {
+			return err
+		}
+		if len(logs) > 0 {
+			if err := tx.CreateInBatches(logs, insertChunk).Error; err != nil {
+				return err
+			}
+		}
+		if len(gwKeys) > 0 {
+			if err := tx.Model(&store.APIKey{}).Where("id IN ?", ids(gwKeys)).
+				Update("last_used_at", now).Error; err != nil {
+				return err
+			}
+		}
+		if len(chKeys) > 0 {
+			if err := tx.Model(&store.ChannelKey{}).Where("id IN ?", ids(chKeys)).
+				Update("last_used_at", now).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// persist 一批日志：单事务 COPY 插入 + 合并 last_used_at UPDATE。
 func (b *Batch) persist(batch []Entry) {
 	start := time.Now()
 	var errMsg string
@@ -198,35 +242,15 @@ func (b *Batch) persist(batch []Entry) {
 	}
 
 	now := time.Now()
-	err := b.db.Transaction(func(tx *gorm.DB) error {
-		// 只对这个事务关掉同步提交：日志是观测数据，丢最近几个事务可以接受，
-		// 换来不必等 WAL 落盘确认。SET LOCAL 随事务结束自动失效，
-		// 所以配置/用户这些写入仍然是默认的 synchronous_commit=on。
-		// （sqlite 的 synchronous=NORMAL 是全库开关，做不到这种区分）
-		if err := tx.Exec("SET LOCAL synchronous_commit = off").Error; err != nil {
-			return err
-		}
-		if len(logs) > 0 {
-			if err := tx.CreateInBatches(logs, insertChunk).Error; err != nil {
-				return err
-			}
-		}
-		// last_used_at 是 last-write-wins，合并成每批一条 UPDATE；
-		// 时间戳取本批刷新时刻（误差 <= 刷新间隔，够用了）。
-		if len(gwKeys) > 0 {
-			if err := tx.Model(&store.APIKey{}).Where("id IN ?", ids(gwKeys)).
-				Update("last_used_at", now).Error; err != nil {
-				return err
-			}
-		}
-		if len(chKeys) > 0 {
-			if err := tx.Model(&store.ChannelKey{}).Where("id IN ?", ids(chKeys)).
-				Update("last_used_at", now).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var err error
+	if b.useCopy.Load() {
+		err = copyLogs(ctx, b.db, logs, ids(gwKeys), ids(chKeys), now)
+	} else {
+		err = b.persistViaGORM(ctx, logs, gwKeys, chKeys, now)
+	}
 	if err != nil {
 		errMsg = "落库失败: " + err.Error()
 		log.Printf("[sink] %s（本批 %d 条）", errMsg, len(logs))
@@ -253,6 +277,7 @@ func (b *Batch) Stats() Stats {
 		Batches:      b.batches.Load(),
 		QueueLen:     len(b.ch),
 		QueueCap:     cap(b.ch),
+		UsingCopy:    b.useCopy.Load(),
 		LastFlushMs:  b.lastFlushMs,
 		LastBatchLen: b.lastBatchLen,
 		LastError:    b.lastErr,
