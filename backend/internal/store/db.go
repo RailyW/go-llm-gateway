@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -51,14 +52,52 @@ func Open(dsn, adminUser, adminPass string, opt Options) (*gorm.DB, error) {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 
+	DB = db
+	// 多实例同时启动时，建表必须串行：否则并发 CREATE TABLE 会撞上
+	// pg_type_typname_nsp_index 唯一约束（PG 的 DDL 不是完全并发安全的），
+	// 实测 4 个实例一起起就有三个启动失败。
+	// pg_advisory_lock 是会话级咨询锁，拿不到就阻塞等，拿到的先建表，
+	// 后面的拿到锁时表已存在，AutoMigrate 自然变成 no-op。
+	if err := withMigrationLock(db, func() error {
+		return migrate(db, adminUser, adminPass)
+	}); err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+// migrationLockID 咨询锁的 ID，任意常量，只要全集群一致。
+const migrationLockID = 7312024
+
+func withMigrationLock(db *gorm.DB, fn func() error) error {
+	// 必须拿同一条连接加锁和解锁（咨询锁是会话级的）
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	conn, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_lock($1)", migrationLockID); err != nil {
+		return fmt.Errorf("获取迁移锁失败: %w", err)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", migrationLockID)
+	}()
+	return fn()
+}
+
+func migrate(db *gorm.DB, adminUser, adminPass string) error {
 	// 先把 groups 建好并写入默认归属，users.group_id 的默认值才有意义
 	if err := db.AutoMigrate(&Group{}); err != nil {
-		return nil, fmt.Errorf("automigrate groups: %w", err)
+		return fmt.Errorf("automigrate groups: %w", err)
 	}
-	DB = db
 	defaultGroup, err := seedDefaultGroup(db)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// 顺序有讲究：外键约束是打开的（PG 加列不重建表，不像 sqlite），
@@ -66,15 +105,12 @@ func Open(dsn, adminUser, adminPass string, opt Options) (*gorm.DB, error) {
 	if err := db.AutoMigrate(
 		&User{}, &Channel{}, &ChannelKey{}, &Model{}, &Binding{}, &APIKey{}, &RequestLog{}, &Setting{},
 	); err != nil {
-		return nil, fmt.Errorf("automigrate: %w", err)
+		return fmt.Errorf("automigrate: %w", err)
 	}
 	if err := seedSettings(db); err != nil {
-		return nil, err
+		return err
 	}
-	if err := seedAdmin(db, adminUser, adminPass, defaultGroup.ID); err != nil {
-		return nil, err
-	}
-	return db, nil
+	return seedAdmin(db, adminUser, adminPass, defaultGroup.ID)
 }
 
 func seedDefaultGroup(db *gorm.DB) (*Group, error) {

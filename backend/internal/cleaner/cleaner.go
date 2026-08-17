@@ -5,6 +5,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RailyW/go-llm-gateway/backend/internal/archive"
@@ -19,19 +20,39 @@ type Status struct {
 	RemovedLogRows int64      `json:"last_removed_log_rows"`
 	LastError      string     `json:"last_error"`
 	Running        bool       `json:"running"`
+	// Skipped 因为没抢到选主锁而跳过的次数（多实例下只有一个实例真正执行）
+	Skipped uint64 `json:"skipped_not_leader"`
+	Leader  bool   `json:"leader"`
+}
+
+// Leader 选主接口（由 coord.Elector 实现）。
+//
+// 为什么清理需要选主：它会 DELETE 历史日志、RemoveAll 归档目录。
+// N 个实例同时跑不只是浪费，而是并发删除 + 各自算保留窗口，行为不可预测。
+type Leader interface {
+	IsLeader() bool
 }
 
 type Cleaner struct {
 	db       *gorm.DB
 	archiver *archive.Archiver
+	// leader 为 nil 时表示无需选主（单实例）
+	leader Leader
 
-	mu     sync.RWMutex
-	status Status
-	kick   chan struct{}
+	mu      sync.RWMutex
+	status  Status
+	skipped atomic.Uint64
+	kick    chan struct{}
 }
 
 func New(db *gorm.DB, archiver *archive.Archiver) *Cleaner {
 	return &Cleaner{db: db, archiver: archiver, kick: make(chan struct{}, 1)}
+}
+
+// WithLeader 挂上选主守卫。没抢到锁就不执行。
+func (c *Cleaner) WithLeader(l Leader) *Cleaner {
+	c.leader = l
+	return c
 }
 
 // Start 起后台 goroutine，启动时先跑一次，之后按 cleanup_interval_minutes 周期跑。
@@ -69,6 +90,13 @@ func (c *Cleaner) Trigger() {
 }
 
 func (c *Cleaner) RunOnce() {
+	// 选主守卫：这里是 fail-closed——抢不到锁（包括 Redis 不可用）就不删。
+	// 数据多留几天没有坏处，多个实例并发删则不可控。
+	if c.leader != nil && !c.leader.IsLeader() {
+		c.skipped.Add(1)
+		return
+	}
+
 	c.mu.Lock()
 	c.status.Running = true
 	c.mu.Unlock()
@@ -113,5 +141,8 @@ func (c *Cleaner) RunOnce() {
 func (c *Cleaner) Status() Status {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.status
+	s := c.status
+	s.Skipped = c.skipped.Load()
+	s.Leader = c.leader == nil || c.leader.IsLeader()
+	return s
 }

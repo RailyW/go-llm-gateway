@@ -121,6 +121,13 @@ func openaiError(c *gin.Context, status int, msg string) {
 
 // invalidateRegistryOnWrite 管理 API 的写操作成功后，同步重建配置快照。
 // 放在中间件里而不是散落在各 handler，避免以后新增接口忘记失效。
+// invalidateRegistryOnWrite 管理 API 的写操作成功后，同步重建本地配置快照，
+// 并广播给其他实例。
+//
+// 两步的分工：
+//   - 本地同步重建：保证「读到自己的写」——管理员改完立刻用新配置试，不能还是旧的
+//   - 广播：其他转发实例收到后各自重建。广播失败不影响本次操作（配置已入库），
+//     最坏是其他实例晚 30 秒（兜底轮询）生效
 func (s *Server) invalidateRegistryOnWrite() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Next()
@@ -133,5 +140,6 @@ func (s *Server) invalidateRegistryOnWrite() gin.HandlerFunc {
 		if err := s.reg.Invalidate(); err != nil {
 			log.Printf("[registry] 重建配置快照失败: %v", err)
 		}
+		s.inval.Publish(c.Request.Context())
 	}
 }

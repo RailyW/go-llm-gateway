@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { api, type ProtocolInfo, type Stats } from '@/lib/api'
+import { api, type Peer, type ProtocolInfo, type Stats } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -114,7 +114,105 @@ export default function DashboardPage() {
         ))}
       </div>
 
-      {sink && (
+      {(stats?.instance || stats?.redis?.enabled) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              集群与协调
+              {stats?.instance && <Badge variant="outline">本机 {stats.instance.id} · {stats.instance.role}</Badge>}
+              {stats?.redis?.enabled ? (
+                stats.redis.healthy ? (
+                  <Badge variant="success">Redis 正常</Badge>
+                ) : (
+                  <Badge variant="destructive">Redis 降级中</Badge>
+                )
+              ) : (
+                <Badge variant="outline">未配置 Redis（单实例）</Badge>
+              )}
+            </CardTitle>
+            <CardDescription>
+              转发（gateway）可横向扩展；管理台（console）与后台（worker）各自独立。
+              Redis 只负责跨实例的配置失效广播与单例任务选主，配置快照仍在各实例本地内存里（热路径零网络）。
+              <b>限流/配额等准入控制在 Redis 不可用时 fail-open（放过）</b>，清理任务则 fail-closed（宁可不删）。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {stats?.redis?.enabled && (
+              <div className="grid gap-3 text-sm sm:grid-cols-3 lg:grid-cols-4">
+                <Metric label="Redis 地址" value={stats.redis.addr || '—'} />
+                <Metric label="调用 / 失败" value={`${stats.redis.calls} / ${stats.redis.failures}`} bad={stats.redis.failures > 0} />
+                <Metric label="降级次数" value={String(stats.redis.degradations)} bad={stats.redis.degradations > 0} />
+                <Metric
+                  label="配置广播"
+                  value={
+                    stats.invalidate && (stats.invalidate as Record<string, unknown>).enabled
+                      ? `已发 ${(stats.invalidate as Record<string, number>).published ?? 0} / 收 ${(stats.invalidate as Record<string, number>).received ?? 0}`
+                      : '未启用'
+                  }
+                />
+              </div>
+            )}
+            {stats?.redis?.last_error && (
+              <p className="text-xs text-destructive">Redis 最近错误：{stats.redis.last_error}</p>
+            )}
+            {stats?.cluster && stats.cluster.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-xs text-muted-foreground">
+                  存活实例（心跳 30 秒过期）。多实例下本页其余指标只反映当前这台，集群情况看这里：
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="text-muted-foreground">
+                      <tr className="border-b border-border">
+                        <th className="py-1.5 text-left font-medium">实例</th>
+                        <th className="py-1.5 text-left font-medium">角色</th>
+                        <th className="py-1.5 text-right font-medium">已落库</th>
+                        <th className="py-1.5 text-right font-medium">丢弃日志</th>
+                        <th className="py-1.5 text-right font-medium">快照模型</th>
+                        <th className="py-1.5 text-right font-medium">心跳</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...stats.cluster]
+                        .sort((a, b) => a.instance.localeCompare(b.instance))
+                        .map((p: Peer) => (
+                          <tr key={p.instance} className="border-b border-border/50">
+                            <td className="py-1.5 font-medium">{p.instance}</td>
+                            <td className="py-1.5">
+                              <Badge variant="outline">{p.role}</Badge>
+                            </td>
+                            <td className="py-1.5 text-right tabular-nums">
+                              {p.sink ? p.sink.persisted.toLocaleString() : '—'}
+                            </td>
+                            <td
+                              className={`py-1.5 text-right tabular-nums ${
+                                (p.logs_dropped ?? 0) > 0 ? 'text-destructive font-medium' : ''
+                              }`}
+                            >
+                              {p.logs_dropped ?? p.sink?.dropped ?? 0}
+                            </td>
+                            <td className="py-1.5 text-right tabular-nums">{p.registry?.models ?? '—'}</td>
+                            <td className="py-1.5 text-right text-muted-foreground">
+                              {p.at ? new Date(p.at).toLocaleTimeString() : '—'}
+                            </td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+                {stats.cluster.some((p) => (p.logs_dropped ?? 0) > 0) && (
+                  <p className="text-xs text-destructive">
+                    有实例在丢日志：gateway 角色目前不直连数据库写日志，而 Redis Streams 队列尚未接入，
+                    因此它转发的请求日志会被丢弃。需要完整日志时请用 role=all 单实例部署。
+                  </p>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {sink?.active && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -163,6 +261,21 @@ export default function DashboardPage() {
               </p>
             )}
           </CardContent>
+        </Card>
+      )}
+
+      {sink && !sink.active && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              异步落库管道
+              <Badge variant="outline">本实例不落库</Badge>
+            </CardTitle>
+            <CardDescription>
+              当前角色（{stats?.instance?.role}）不承担日志落库，队列与 COPY 指标在这里没有意义。
+              落库情况请看上面「集群与协调」里 worker/all 实例那几行。
+            </CardDescription>
+          </CardHeader>
         </Card>
       )}
 

@@ -13,6 +13,8 @@ import (
 // Config 全部通过环境变量注入，DEMO 级别，给了合理默认值。
 // 启动时会先加载当前目录的 .env（已存在的真实环境变量优先，不被覆盖）。
 type Config struct {
+	Role          Role   // 进程角色：all / gateway / console / worker
+	InstanceID    string // 实例标识（多实例下区分日志与心跳）
 	Port          string // 监听端口
 	DataDir       string // 数据目录（原文归档）
 	DSN           string // PostgreSQL 连接串
@@ -24,29 +26,74 @@ type Config struct {
 	AdminPass     string // 初始管理员密码
 	AllowRegister bool   // 是否允许自助注册
 	LogQueueSize  int    // 异步落库队列容量（满了丢日志行，不阻塞转发）
+
+	// ---------- Redis（可选，fail-open）----------
+	RedisAddr      string
+	RedisPassword  string
+	RedisDB        int
+	RedisPrefix    string
+	RedisTimeoutMs int
 }
 
 func Load() *Config {
 	LoadDotEnv(".env")
 
 	dataDir := env("GATEWAY_DATA_DIR", "./data")
+	role := parseRole(env("GATEWAY_ROLE", string(RoleAll)))
 	c := &Config{
-		Port:          env("GATEWAY_PORT", "8080"),
-		DataDir:       dataDir,
-		DSN:           dsn(),
-		DBMaxOpen:     envInt("GATEWAY_DB_MAX_OPEN", 32),
-		DBMaxIdle:     envInt("GATEWAY_DB_MAX_IDLE", 8),
+		Role:       role,
+		InstanceID: instanceID(),
+		Port:       env("GATEWAY_PORT", "8080"),
+		DataDir:    dataDir,
+		DSN:        dsn(),
+		// gateway 角色的热路径靠内存快照，PG 只在启动/失效时读，所以连接池可以很小。
+		// 这很重要：N 个转发实例 × 32 连接会直接打穿 PG 默认的 max_connections=100。
+		DBMaxOpen:     envInt("GATEWAY_DB_MAX_OPEN", defaultDBMaxOpen(role)),
+		DBMaxIdle:     envInt("GATEWAY_DB_MAX_IDLE", defaultDBMaxIdle(role)),
 		ArchiveDir:    env("GATEWAY_ARCHIVE_DIR", filepath.Join(dataDir, "archive")),
 		JWTSecret:     env("GATEWAY_JWT_SECRET", "dev-insecure-secret-change-me"),
 		AdminUser:     env("GATEWAY_ADMIN_USER", "admin"),
 		AdminPass:     env("GATEWAY_ADMIN_PASS", "admin"),
 		AllowRegister: envBool("GATEWAY_ALLOW_REGISTER", true),
 		// 队列里只放日志行（~350 字节/条），所以 32768 条也只有 ~11MB。
-		// 定这个数是为了吞下**突发**：压测里 20000 个请求在 0.9 秒内砸进来，
-		// 8192 的队列装不下（那是当初按「每条 Entry 很大」拍的，摘掉原文后明显偏小）。
+		// 定这个数是为了吞下**突发**：压测里 20000 个请求在 0.9 秒内砸进来。
 		LogQueueSize: envInt("GATEWAY_LOG_QUEUE_SIZE", 32768),
+
+		RedisAddr:      env("GATEWAY_REDIS_ADDR", ""),
+		RedisPassword:  env("GATEWAY_REDIS_PASSWORD", ""),
+		RedisDB:        envIntAllowZero("GATEWAY_REDIS_DB", 0),
+		RedisPrefix:    env("GATEWAY_REDIS_PREFIX", "gw"),
+		RedisTimeoutMs: envInt("GATEWAY_REDIS_TIMEOUT_MS", 50),
 	}
 	return c
+}
+
+// defaultDBMaxOpen 转发实例不需要大连接池（只读快照），
+// 而 console/worker 是真正干活的（查询、落库、清理）。
+func defaultDBMaxOpen(r Role) int {
+	if r == RoleGateway {
+		return 8
+	}
+	return 32
+}
+
+func defaultDBMaxIdle(r Role) int {
+	if r == RoleGateway {
+		return 2
+	}
+	return 8
+}
+
+// instanceID 优先用显式配置，其次主机名（容器里就是容器 ID），
+// 多实例时用来区分心跳与日志。
+func instanceID() string {
+	if v := os.Getenv("GATEWAY_INSTANCE_ID"); v != "" {
+		return v
+	}
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "instance"
 }
 
 // dsn 优先用整条 GATEWAY_DB_DSN；没给就按分量拼。
@@ -142,6 +189,16 @@ func env(k, def string) string {
 func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// envIntAllowZero 与 envInt 的区别：接受 0（比如 Redis 的 DB 编号）。
+func envIntAllowZero(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
 		}
 	}

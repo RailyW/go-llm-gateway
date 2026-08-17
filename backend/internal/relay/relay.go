@@ -100,7 +100,7 @@ func (s *Service) Handle(p Protocol, w http.ResponseWriter, r *http.Request, act
 	c := &call{
 		proto:     p,
 		dateDir:   dateDir,
-		archiving: store.GetSettingBool(store.KeyArchiveEnabled, false),
+		archiving: store.ArchiveEnabled(),
 		rec: &store.RequestLog{
 			ID:          reqID,
 			Protocol:    p.Name(),

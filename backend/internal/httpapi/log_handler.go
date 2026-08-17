@@ -61,7 +61,17 @@ func (s *Server) getLog(c *gin.Context) {
 }
 
 // getLogArchive 读取本地归档的请求/响应原文（文件名 = 日志 id）。
+//
+// 归档功能目前停用（store.ArchiveFeatureEnabled=false）：它写本地磁盘，
+// 而转发已经是多实例了，文件只在处理该请求的那个实例上。
+// 接口保留，但直接返回 501 并说清楚原因，别让人以为是数据丢了。
 func (s *Server) getLogArchive(c *gin.Context) {
+	if !store.ArchiveFeatureEnabled {
+		fail(c, http.StatusNotImplemented,
+			"原文归档功能已暂停：归档写在单台实例的本地磁盘上，跟多实例转发不兼容。"+
+				"待改成共享存储（S3/MinIO）后重新开启")
+		return
+	}
 	l, ok := s.visibleLog(c)
 	if !ok {
 		return
@@ -151,9 +161,25 @@ func (s *Server) stats(c *gin.Context) {
 		out["models"] = models
 		out["users"] = users
 		out["groups"] = groups
-		out["cleaner"] = s.cleaner.Status()
+		if s.cleaner != nil {
+			out["cleaner"] = s.cleaner.Status()
+		}
 		out["sink"] = s.sink.Stats()    // 异步落库管道健康度（丢弃必须可见）
 		out["registry"] = s.reg.Stats() // 配置快照状态
+		// 多实例相关：角色、Redis 健康度、降级情况、广播与选主。
+		// fail-open 最大的风险是「静默裸奔」，所以降级必须在这里看得见。
+		out["instance"] = gin.H{
+			"id":             s.cfg.InstanceID,
+			"role":           string(s.cfg.Role),
+			"role_label":     s.cfg.Role.Label(),
+			"archive_usable": store.ArchiveFeatureEnabled,
+		}
+		out["redis"] = s.rc.Stats()
+		out["invalidate"] = s.inval.Stats()
+		// 集群视图：各实例上报的心跳。多实例下这是唯一能看到 gateway 实例状态的地方
+		if peers := s.hb.Peers(c.Request.Context()); peers != nil {
+			out["cluster"] = peers
+		}
 	}
 	c.JSON(http.StatusOK, out)
 }

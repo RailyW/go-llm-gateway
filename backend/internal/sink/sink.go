@@ -54,6 +54,9 @@ type Stats struct {
 	LastError    string `json:"last_error"`
 	// UsingCopy 是否在用 COPY 快路径（false = 已退化到逐行 INSERT，吞吐约 1/5）
 	UsingCopy bool `json:"using_copy"`
+	// Active 本实例是否真的承担落库职责。gateway 角色为 false，
+	// 此时上面那些指标都没有意义，前端不该拿它们报警。
+	Active bool `json:"active"`
 }
 
 // Sink 落库管道。
@@ -278,6 +281,7 @@ func (b *Batch) Stats() Stats {
 		QueueLen:     len(b.ch),
 		QueueCap:     cap(b.ch),
 		UsingCopy:    b.useCopy.Load(),
+		Active:       true,
 		LastFlushMs:  b.lastFlushMs,
 		LastBatchLen: b.lastBatchLen,
 		LastError:    b.lastErr,
@@ -321,3 +325,24 @@ func ids(m map[uint]struct{}) []uint {
 	}
 	return out
 }
+
+// Discard 不落库的实现，给 gateway 角色用。
+//
+// 注意这是**临时形态**：拆角色的第一步先让 gateway 不直连 PG 写日志，
+// 但日志确实被丢掉了。下一步会换成 Redis Streams 实现（XADD 进队列，worker 消费），
+// 那时 gateway 既不写 PG 也不丢日志。留一个显式的 Discard 而不是 nil，
+// 是为了让「日志去哪了」这件事在代码里有名字、并且能在 Console 上看见。
+type Discard struct{ dropped atomic.Uint64 }
+
+func (d *Discard) Submit(Entry) bool {
+	d.dropped.Add(1)
+	return false
+}
+
+func (d *Discard) Stats() Stats {
+	n := d.dropped.Load()
+	// Active=false：前端据此不展示队列/COPY 之类的指标，那些在这里没有意义
+	return Stats{Enqueued: n, Dropped: n, Active: false}
+}
+
+func (d *Discard) Close(context.Context) error { return nil }

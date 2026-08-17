@@ -22,8 +22,18 @@ const (
 	KeyUpstreamTimeoutSecond = "upstream_timeout_seconds" // 上游超时（流式不受限）
 	KeyLogFlushIntervalMs    = "log_flush_interval_ms"    // 异步落库：攒批时间窗
 	KeyLogFlushBatch         = "log_flush_batch"          // 异步落库：单批最大条数
-	KeyArchiveEnabled        = "archive_enabled"          // 是否归档请求/响应原文（默认关）
+	KeyArchiveEnabled        = "archive_enabled"          // 是否归档请求/响应原文（目前已停用，见 ArchiveFeatureEnabled）
 )
+
+// ArchiveFeatureEnabled 原文归档功能的**总开关**，当前硬编码关闭。
+//
+// 为什么停用：归档写的是**本地磁盘**，而转发已经要多实例水平扩展了。
+// 请求落在实例 3 上，归档文件就只在实例 3 的盘上；而日志页在 console 实例上，
+// 根本读不到——只会给用户一个迷惑的「原文不存在」。
+//
+// 要真正恢复这个功能，得先把存储换成共享的（S3/MinIO 或共享卷），
+// 那是独立一轮的事。代码（internal/archive）全部保留，只是不再被调用。
+const ArchiveFeatureEnabled = false
 
 var defaults = map[string]string{
 	KeyArchiveRetentionDays:  "7",
@@ -39,6 +49,15 @@ var defaults = map[string]string{
 	// 默认关：原文是增长最快的部分，只在排查问题时才需要，
 	// 不该默认就把每个请求的完整 body 写上磁盘。
 	KeyArchiveEnabled: "false",
+}
+
+// ArchiveEnabled 归档是否开启。总开关关闭时永远返回 false，
+// 不管数据库里的设置是什么（旧库里可能已经被打开过）。
+func ArchiveEnabled() bool {
+	if !ArchiveFeatureEnabled {
+		return false
+	}
+	return GetSettingBool(KeyArchiveEnabled, false)
 }
 
 var (

@@ -109,6 +109,7 @@ export interface SinkStats {
   last_batch_len: number
   last_error: string
   using_copy: boolean
+  active: boolean
 }
 export interface RegistryStats {
   built_at: string
@@ -117,6 +118,36 @@ export interface RegistryStats {
   models: number
   key_sets: number
 }
+export interface RedisStats {
+  enabled: boolean
+  healthy: boolean
+  breaker_open: boolean
+  calls: number
+  failures: number
+  degradations: number
+  degraded_since?: string
+  last_error?: string
+  addr?: string
+}
+
+export interface InstanceInfo {
+  id: string
+  role: string
+  role_label: string
+  archive_usable: boolean
+}
+
+export interface Peer {
+  instance: string
+  role: string
+  at: string
+  port?: string
+  persists?: boolean
+  logs_dropped?: number
+  sink?: SinkStats
+  registry?: RegistryStats
+}
+
 export interface Stats {
   window: '1h' | '24h'
   since: string
@@ -132,6 +163,10 @@ export interface Stats {
   cleaner?: CleanerStatus
   sink?: SinkStats
   registry?: RegistryStats
+  instance?: InstanceInfo
+  redis?: RedisStats
+  invalidate?: Record<string, unknown>
+  cluster?: Peer[]
 }
 export interface CleanerStatus {
   last_run_at: string | null
@@ -140,6 +175,7 @@ export interface CleanerStatus {
   last_removed_log_rows: number
   last_error: string
   using_copy: boolean
+  active: boolean
   running: boolean
 }
 

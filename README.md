@@ -32,6 +32,69 @@
 请求体除了把 `model` 换成上游模型名之外**原样透传**，响应（含 SSE 流）**原样回吐**。
 上游录入时勾选它支持哪些协议端点；路由时只有勾了对应协议的绑定才参与选择。
 
+## 架构：转发 / 控制 / 落库 解耦
+
+同一个二进制，靠 `GATEWAY_ROLE` 切换职责。**目标是让转发实例变成无状态、可随时杀、
+不持有写职责的东西**，于是它可以横向扩展，而控制台与落库不受影响。
+
+| 角色 | 对外 | PostgreSQL | 职责 |
+| --- | --- | --- | --- |
+| `all`（默认） | `/v1/*` + `/api/*` + WebUI | 读写（池 32） | 单进程全功能，本地开发与小规模部署 |
+| `gateway` | 只有 `/v1/*` | **只读，且只在启动/失效时读**（池 8） | 只转发，**可横向扩展** |
+| `console` | 只有 `/api/*` + WebUI | 读写（池 32） | 管理台，不接转发流量 |
+| `worker` | 只有 `/healthz` | 只写日志（池 32） | 消费日志队列 + 清理（需选主） |
+
+```bash
+make cluster   # 本地起 1 console(:8080) + 2 gateway(:8081/:8082) + 1 worker
+```
+
+为什么 gateway 的连接池要调小：N 个转发实例 × 32 连接会直接打穿 PG 默认的
+`max_connections=100`。而它的热路径本来就不查库（内存快照），8 个连接绰绰有余。
+
+### Redis 的职责边界
+
+Redis 只做**跨实例才需要的事**，不碰热路径数据：
+
+| 用途 | 说明 |
+| --- | --- |
+| 配置失效广播（Pub/Sub） | 管理台改完配置，各转发实例**立刻**重建本地快照。实测 0.3 秒内生效，此前要等 30 秒兜底轮询 |
+| 单例任务选主 | 清理任务只能有一个执行者，否则 N 个实例并发删同一批数据 |
+| 实例心跳 | 各实例把状态写进 Redis（带 TTL），管理台聚合成「集群」视图 |
+| （后续）限流/配额/并发数 | 唯一必须同步、原子、跨实例的能力 |
+
+**不交给 Redis 的**：配置快照本体仍在各实例本地内存（`atomic.Pointer`，纳秒级）。
+Redis 只负责「通知失效」，不负责「存配置」——热路径不该有网络故障面。
+
+### 故障语义：fail-open，但降级必须可见
+
+Redis 挂了网关继续转发。这是显式选择：Redis 承担的是限流/协调，
+**宁可超额，不可拒服务**。
+
+| 能力 | Redis 不可用时 |
+| --- | --- |
+| 配置失效广播 | 退回 30 秒兜底轮询（配置变更最多迟 30 秒生效） |
+| 限流/配额（后续） | **放过**（fail-open） |
+| 清理任务选主 | **停止清理**（fail-**closed**：宁可不删，不可重复删） |
+
+两个必要的配套，否则 fail-open 会变成「静默裸奔」：
+
+1. **降级可见**：概览页「集群与协调」卡片显示 Redis 健康度、降级次数、最近错误。
+   这跟日志丢弃计数是同一个原则——**隐性故障是不可接受的**。
+2. **超时 + 熔断**：每次 Redis 调用独立超时（默认 50ms），连续失败打开熔断直接短路。
+   因为**慢比挂危险**：彻底挂掉会立刻返回错误，反而安全；变慢会把转发一起拖死。
+
+单实例（未配置 Redis）时一切照旧：选主进入 solo 模式直接视为 leader，
+否则本地开发会永远不清理。
+
+### 当前的已知缺口
+
+- **gateway 角色转发的请求日志会被丢弃**。它已经不直连 PG 写日志了（这是解耦的目的），
+  但 Redis Streams 队列还没接，所以日志暂时没有去处。集群视图里会用红色标出丢弃数，
+  启动日志也会显式警告。需要完整日志时用 `role=all` 单实例部署。
+- **原文归档功能已停用**（`store.ArchiveFeatureEnabled = false`）。它写本地磁盘，
+  而请求落在哪个实例是不确定的，管理台根本读不到那个文件。代码全部保留，
+  等换成共享存储（S3/MinIO）后再开。
+
 ## 存储选型：PostgreSQL + 磁盘归档
 
 **结构化数据进 PostgreSQL，请求/响应原文进磁盘文件**，这是两类完全不同的数据：
@@ -173,8 +236,8 @@ LLM 调用可忽略；而攒批只对数据库写入有意义（减事务、减 
 ### 流式响应不再攒内存
 
 原先流式响应为了归档会把整个 SSE 攒在内存（每请求上限 8MB），20 个并发长回答就是 160MB。
-现在是**边转发边追加写文件**（64KB bufio），实测 20 个并发 × 12MB 流式响应：
-进程 RSS 仅 +19MB，归档文件完整 12.2MB 落盘。（当然，归档默认是关的。）
+改成**边转发边追加写文件**（64KB bufio）后实测 20 个并发 × 12MB 流式响应：
+进程 RSS 仅 +19MB，归档文件完整 12.2MB 落盘。（归档功能目前已停用，但这个性质保留在代码里。）
 
 概览页的统计只按**时间窗口**（1 小时 / 1 天）查询，不做全表 `COUNT/SUM`——
 logs 表会一直增长，全表扫描的首页迟早会拖垮。
@@ -193,15 +256,15 @@ logs 表会一直增长，全表扫描的首页迟早会拖垮。
 | API Key | 网关自己发放的 `sk-...`，归属用户，可停用/删除 |
 | 网关端点 | `/v1/chat/completions`、`/v1/responses`、`/v1/messages`（都含 **SSE 流式**）、`GET /v1/models` |
 | 日志 | `logs` 表：用户+归属、端点/协议、模型、上游+实际用的上游 key、tokens、耗时、状态码、错误 |
-| 原文归档 | 每次请求的**请求原文 + 响应全文**落本地文件，文件名 = 日志的 request id；**默认关闭** |
-| 清理服务 | 后台 goroutine 按保留天数（默认 7 天，WebUI 可改）删除归档与历史日志 |
+| 原文归档 | ~~请求原文 + 响应全文落本地文件~~ **已停用**（写本地盘，与多实例转发不兼容） |
+| 清理服务 | 后台 goroutine 按保留天数（默认 7 天，WebUI 可改）删除历史日志；多实例下经 Redis 选主，只有一个实例执行 |
 
 不做：计费/额度、渠道健康检查与重试、协议互转（openai ↔ anthropic 的 body 翻译）、embeddings/images 等其它端点。
 
 ## 快速开始
 
 ```bash
-# 依赖：Go 1.22+ / Node 20+ / 一个 PostgreSQL 14+
+# 依赖：Go 1.22+ / Node 20+ / 一个 PostgreSQL 14+（Redis 可选，多实例才需要）
 make db-up      # 用 docker compose 起 PG（库 gateway / gateway_test，账号 gateway/gateway）
 cp .env.example .env   # 可选：改端口/密码/密钥；真实环境变量优先级高于 .env
 make build      # 构建前端并打包成单个二进制 bin/gateway（前端已 embed）
@@ -210,6 +273,17 @@ make build      # 构建前端并打包成单个二进制 bin/gateway（前端�
 
 已经有 PG 的话不用 `make db-up`，建个库然后设 `GATEWAY_DB_*`（或整条 `GATEWAY_DB_DSN`）即可。
 表结构由 `AutoMigrate` 自动创建，首次启动会写入默认归属 `default` 与管理员 `admin/admin`。
+
+多实例（转发横向扩展）：
+
+```bash
+# .env 里配上 GATEWAY_REDIS_ADDR，然后
+make cluster        # 1 console(:8080) + 2 gateway(:8081/:8082) + 1 worker
+make cluster-down
+```
+
+管理台在 :8080，转发流量打 :8081 / :8082（前面通常再挂个负载均衡）。
+在管理台改配置，两个 gateway 会通过 Redis 广播**立刻**生效。
 
 开发模式（前后端分离热更新）：
 
@@ -248,6 +322,7 @@ curl http://localhost:8080/v1/messages \
 backend/
   cmd/server/main.go              启动、优雅退出
   internal/config/                环境变量配置（含极简 .env 加载）
+    role.go                       ★ 进程角色定义（all/gateway/console/worker）
   internal/store/                 GORM 模型 / PostgreSQL / 设置 KV（含默认值与缓存）
     jsonb.go                      ★ jsonb 列的最小封装（原始 JSON 直存直取）
   internal/storetest/             测试用的一次性 PG 环境（每个测试一个独立 schema）
@@ -264,6 +339,8 @@ backend/
   internal/sink/                  ★ 日志异步批量落库（队列只放日志行，~350 字节/条）
     copy.go                       ★ pgx COPY 快路径（比 GORM 快 4~6 倍）+ 列清单漂移校验
   internal/registry/              ★ 配置内存快照，转发热路径零查询
+  internal/rds/                   ★ Redis 封装：超时 + 熔断 + 降级可见（fail-open）
+  internal/coord/                 ★ 多实例协调：配置失效广播 / 单例选主 / 实例心跳
   internal/cleaner/               后台清理服务
   internal/httpapi/               gin 路由、中间件、各资源 handler、静态前端挂载
   internal/web/                   //go:embed dist（前端产物）
@@ -274,7 +351,7 @@ scripts/mock_upstream.py          本地 mock 上游
 ## 数据与文件
 
 - 结构化数据：PostgreSQL（`AutoMigrate` 建表，外键约束打开）
-- 归档原文（**默认关闭**，设置页「归档请求/响应原文」可开）：
+- 归档原文（**功能已停用**，见上面「当前的已知缺口」）：
   `data/archive/<YYYY-MM-DD>/<request-id>.request.json` 与 `<request-id>.response.txt`
   - `request.json` 含元信息（用户、key、模型、上游 URL）+ 客户端原始 body
   - `response.txt` 非流式为完整响应体，流式为完整 SSE 文本（边转发边追加写，单文件上限 32MB 后截断）
@@ -300,6 +377,12 @@ scripts/mock_upstream.py          本地 mock 上游
 | `GATEWAY_DB_TIMEZONE` | `Asia/Shanghai` | |
 | `GATEWAY_DB_MAX_OPEN` / `_MAX_IDLE` | `32` / `8` | 连接池；别超过 PG 的 `max_connections` |
 | `GATEWAY_TEST_DSN` | 无 | `go test` 用的库；不设则跳过需要数据库的测试 |
+| `GATEWAY_ROLE` | `all` | 进程角色：`all` / `gateway` / `console` / `worker` |
+| `GATEWAY_INSTANCE_ID` | 主机名 | 多实例下区分心跳与日志 |
+| `GATEWAY_REDIS_ADDR` | 空 | 不配则为单实例模式（无广播、无选主） |
+| `GATEWAY_REDIS_PASSWORD` / `_DB` / `_PREFIX` | — / `0` / `gw` | |
+| `GATEWAY_REDIS_TIMEOUT_MS` | `50` | 单次命令超时；慢比挂危险 |
+| `GATEWAY_TEST_REDIS_ADDR` | 无 | 协调层测试用；不设则跳过 |
 
 启动时会读当前目录的 `.env`（见 `.env.example`），**已存在的真实环境变量不会被覆盖**。
 
@@ -334,6 +417,18 @@ type Protocol interface {
 三个已实现协议的差异就只有：**路径、鉴权头、usage 字段、错误体格式**——body 不碰。
 
 **加一个上游选择策略**（如轮询、最少失败）：在 `internal/relay/selector/` 实现 `Selector` 并 `Register`。
+
+**接入 Redis Streams**：让 gateway 角色 `XADD` 进队列、worker 消费后批量写 PG。
+这样转发实例既不连 PG 写库、也不丢日志，而且网关重启不丢（现在 `kill -9` 会丢最后一批）。
+`sink.Sink` 是接口，现在的进程内实现原地留着当 Redis 不可用时的降级路径。
+
+**限流 / 配额 / 并发数**：这是唯一「必须同步、原子、跨实例」的能力，只能靠 Redis
+（`INCR`+`EXPIRE` 或 Lua 令牌桶）。对 LLM 网关**并发数限制比 RPS 更重要**——
+请求要占着上游连接几十秒。fail-open，但要有本地兜底配额（全局配额 / 实例数），
+免得一次 Redis 故障就让上游账单失控。
+
+**上游 key 熔断冷却**：撞了 429/401 就 `SET cooldown EX 60`，所有实例立刻绕开这把 key。
+现在是撞了也毫无反应，下一个请求还往同一把打。
 
 **日志表按天分区**：`request_logs` 现在是普通表，保留策略靠 `DELETE`。上量后应改成
 `PARTITION BY RANGE (created_at)` + 按天 `DROP PARTITION`——瞬间完成、不产生死行、不用等 autovacuum。

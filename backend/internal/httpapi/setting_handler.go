@@ -12,13 +12,17 @@ import (
 )
 
 func (s *Server) getSettings(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
+	out := gin.H{
 		"settings":       store.AllSettings(),
 		"strategies":     selector.Names(),
 		"key_strategies": keyselector.Names(),
 		"protocols":      relay.ProtocolInfos(),
-		"cleaner":        s.cleaner.Status(),
-	})
+	}
+	// console 角色不跑清理任务，此时没有 cleaner
+	if s.cleaner != nil {
+		out["cleaner"] = s.cleaner.Status()
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 func (s *Server) updateSettings(c *gin.Context) {
@@ -82,7 +86,15 @@ func (s *Server) updateSettings(c *gin.Context) {
 }
 
 // triggerCleanup 立即跑一次清理。
+//
+// 多实例下清理由 worker 角色选主执行，console 自己不持有 cleaner；
+// 这时候得告诉用户去哪儿看，而不是默默什么都不做。
 func (s *Server) triggerCleanup(c *gin.Context) {
+	if s.cleaner == nil {
+		fail(c, http.StatusNotImplemented,
+			"本实例（角色 "+string(s.cfg.Role)+"）不运行清理任务，请在 worker/all 实例上触发或等它按周期执行")
+		return
+	}
 	s.cleaner.RunOnce()
 	c.JSON(http.StatusOK, gin.H{"ok": true, "cleaner": s.cleaner.Status()})
 }
